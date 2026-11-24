@@ -432,6 +432,15 @@ impl App {
                                 self.cache.seen.insert(i.key.clone(), i.updated.clone());
                             }
                         }
+                        // drop cached details of issues that changed on the server
+                        if let Some(old) = self.issues.get(&k) {
+                            let before: HashMap<&String, &String> = old.iter().map(|i| (&i.key, &i.updated)).collect();
+                            for i in &list {
+                                if before.get(&i.key) != Some(&&i.updated) {
+                                    self.details.remove(&i.key);
+                                }
+                            }
+                        }
                         let at = cache::now();
                         self.cache.lists.insert(k.clone(), cache::CachedList { jql, issues: list.clone(), at });
                         self.fetched_at.insert(k.clone(), at);

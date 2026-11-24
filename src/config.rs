@@ -41,6 +41,12 @@ pub fn load() -> Result<Config> {
             let _ = std::fs::create_dir_all(dir);
         }
         if std::fs::write(&p, EXAMPLE).is_ok() {
+            // the file will hold an API token: keep it private
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+            }
             if cfg!(windows) {
                 let _ = open::that_detached(&p); // opens in Notepad
             }
@@ -54,6 +60,9 @@ pub fn load() -> Result<Config> {
         cfg.api_token = t;
     }
     cfg.base_url = cfg.base_url.trim_end_matches('/').to_string();
+    if !cfg.base_url.starts_with("https://") {
+        bail!("base_url must start with https:// (the API token would be sent unencrypted)\nEdit: {}", p.display());
+    }
     if cfg.base_url.contains("your-site") || cfg.email == "you@example.com" || cfg.api_token == "..." {
         bail!("Config still has the example values. Edit:\n  {}", p.display());
     }
