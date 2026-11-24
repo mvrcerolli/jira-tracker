@@ -1,0 +1,76 @@
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use std::path::PathBuf;
+
+#[derive(Deserialize, Clone)]
+pub struct Config {
+    pub base_url: String,
+    pub email: String,
+    #[serde(default)]
+    pub api_token: String,
+    /// Optional: only show these project keys (in this order).
+    #[serde(default)]
+    pub projects: Vec<String>,
+}
+
+pub const EXAMPLE: &str = r#"base_url  = "https://your-site.atlassian.net"
+email     = "you@example.com"
+api_token = "..."            # or set JIRA_API_TOKEN
+# projects = ["ABC", "XYZ"]  # optional: limit/pin projects
+"#;
+
+pub fn path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("jt/config.toml")
+}
+
+pub fn load() -> Result<Config> {
+    let p = path();
+    if !p.exists() {
+        // Create a template so the user only has to fill it in.
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if std::fs::write(&p, EXAMPLE).is_ok() {
+            if cfg!(windows) {
+                let _ = open::that_detached(&p); // opens in Notepad
+            }
+            bail!("Created config template at:\n  {}\n\nFill in base_url, email and api_token, save it, then run jt again.", p.display());
+        }
+        bail!("No config found. Create {} with:\n\n{EXAMPLE}", p.display());
+    }
+    let raw = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+    let mut cfg: Config = toml::from_str(&raw).with_context(|| format!("parsing {}", p.display()))?;
+    if let Ok(t) = std::env::var("JIRA_API_TOKEN") {
+        cfg.api_token = t;
+    }
+    cfg.base_url = cfg.base_url.trim_end_matches('/').to_string();
+    if cfg.base_url.contains("your-site") || cfg.email == "you@example.com" || cfg.api_token == "..." {
+        bail!("Config still has the example values. Edit:\n  {}", p.display());
+    }
+    if cfg.api_token.is_empty() {
+        bail!("api_token missing: set it in {} or JIRA_API_TOKEN", p.display());
+    }
+    Ok(cfg)
+}
+
+fn pins_path() -> PathBuf {
+    path().with_file_name("pinned.txt")
+}
+
+/// Pinned project keys, in pin order.
+pub fn load_pins() -> Vec<String> {
+    std::fs::read_to_string(pins_path())
+        .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+pub fn save_pins(pins: &[String]) -> Result<()> {
+    let p = pins_path();
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&p, pins.join("\n") + "\n")?;
+    Ok(())
+}
