@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 pub const ME: &str = "@me";
 pub const NOBODY: &str = "@none";
+/// Pseudo-project: issues assigned to me in every project.
+pub const MY_WORK: &str = "@me";
 /// Max issues fetched per project (Done can be huge).
 pub const MAX_ISSUES: usize = 1000;
 
@@ -216,7 +218,11 @@ impl Filter {
     }
 
     pub fn to_jql(&self, project: &str) -> String {
-        let mut parts = vec![format!("project = {}", q(project))];
+        let mut parts = vec![if project == MY_WORK {
+            "assignee = currentUser()".to_string()
+        } else {
+            format!("project = {}", q(project))
+        }];
         match &self.statuses {
             None => parts.push("statusCategory != Done".into()),
             Some(v) if !v.is_empty() => parts.push(format!("status in ({})", list(v))),
@@ -343,6 +349,14 @@ mod tests {
         assert_eq!(f.short(), "all");
         f.reset(Group::Status);
         assert!(f.is_default());
+    }
+
+    #[test]
+    fn my_work_jql() {
+        assert_eq!(
+            Filter::default().to_jql(MY_WORK),
+            "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod app;
+mod cache;
 mod config;
 mod filter;
 mod jira;
@@ -37,6 +38,7 @@ fn main() -> anyhow::Result<()> {
         Ok(())
     })();
     ratatui::restore();
+    app.save_cache();
     if let Err(e) = res {
         fail(&format!("Error: {e}"));
     }

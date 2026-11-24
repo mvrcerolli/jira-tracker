@@ -1,4 +1,5 @@
-use crate::filter::{self, Choice, Filter, FilterOpts, FilterPanel, Group};
+use crate::cache::{self, Cache};
+use crate::filter::{self, Choice, Filter, FilterOpts, FilterPanel, Group, MY_WORK};
 use crate::jira::{Client, Detail, Issue, Project};
 use std::collections::BTreeMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -19,7 +20,7 @@ pub enum Msg {
     FilterOpts(String, Res<FilterOpts>),
     Detail(String, Res<Box<Detail>>),
     Options(u64, Res<(Vec<Opt>, TransMap)>),
-    Applied { project: String, keys: Vec<String>, ok: usize, errs: Vec<String> },
+    Applied { keys: Vec<String>, ok: usize, errs: Vec<String> },
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -122,6 +123,14 @@ pub struct App {
     pub filter_opts: HashMap<String, FilterOpts>,
     filter_opts_loading: HashSet<String>,
     pub fpanel: Option<FilterPanel>,
+    pub cache: Cache,
+    /// views fetched from Jira during this session (others show cached data)
+    pub fresh: HashSet<String>,
+    /// view -> unix time its data was fetched
+    pub fetched_at: HashMap<String, u64>,
+    last_refresh: Instant,
+    /// issues I just edited: mark as seen once they come back
+    just_edited: HashSet<String>,
     pub loading_projects: bool,
     pub issue_state: TableState,
     pub marked: HashSet<String>,
@@ -159,6 +168,11 @@ impl App {
             filter_opts: HashMap::new(),
             filter_opts_loading: HashSet::new(),
             fpanel: None,
+            cache: Cache::default(),
+            fresh: HashSet::new(),
+            fetched_at: HashMap::new(),
+            last_refresh: Instant::now(),
+            just_edited: HashSet::new(),
             loading_projects: false,
             issue_state: TableState::default(),
             marked: HashSet::new(),
@@ -182,8 +196,69 @@ impl App {
             busy: false,
             quit: false,
         };
+        app.load_cache();
         app.fetch_projects();
+        app.ensure_issues();
         app
+    }
+
+    // ---------- cache / seen ----------
+    fn load_cache(&mut self) {
+        self.cache = cache::load(self.client.base_url());
+        self.projects = with_my_work(self.cache.projects.clone());
+        self.sort_projects(None);
+        self.proj_state.select(Some(0));
+        let lists: Vec<(String, cache::CachedList)> =
+            self.cache.lists.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        for (view, l) in lists {
+            if l.jql == self.filter_for(&view).to_jql(&view) {
+                self.fetched_at.insert(view.clone(), l.at);
+                self.issues.insert(view, l.issues);
+            }
+        }
+        self.clamp_issue();
+    }
+
+    pub fn save_cache(&mut self) {
+        // forget "seen" entries for issues no longer in any cached list
+        let live: HashSet<&String> = self.cache.lists.values().flat_map(|l| l.issues.iter().map(|i| &i.key)).collect();
+        let seen: HashMap<String, String> =
+            self.cache.seen.iter().filter(|(k, _)| live.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+        self.cache.seen = seen;
+        cache::save(&self.cache);
+    }
+
+    /// New or updated since the user last looked at it.
+    pub fn is_changed(&self, i: &Issue) -> bool {
+        self.cache.seen.get(&i.key) != Some(&i.updated)
+    }
+
+    pub fn changed_count(&self, view: &str) -> usize {
+        if !self.cache.baselined.contains(view) {
+            return 0;
+        }
+        self.issues.get(view).map(|l| l.iter().filter(|i| self.is_changed(i)).count()).unwrap_or(0)
+    }
+
+    fn mark_seen(&mut self, keys: &[String]) {
+        let Some(view) = self.current_project().map(|p| p.key.clone()) else { return };
+        let Some(list) = self.issues.get(&view) else { return };
+        for i in list.iter().filter(|i| keys.contains(&i.key)) {
+            self.cache.seen.insert(i.key.clone(), i.updated.clone());
+        }
+    }
+
+    fn refresh_all(&mut self) {
+        let mut views: Vec<String> = self.fresh.iter().cloned().collect();
+        if let Some(k) = self.current_project().map(|p| p.key.clone())
+            && !views.contains(&k)
+        {
+            views.push(k);
+        }
+        for v in views {
+            self.fetch_issues(v);
+        }
+        self.last_refresh = Instant::now();
     }
 
     pub fn current_project(&self) -> Option<&Project> {
@@ -290,7 +365,7 @@ impl App {
 
     fn ensure_issues(&mut self) {
         if let Some(k) = self.current_project().map(|p| p.key.clone())
-            && !self.issues.contains_key(&k)
+            && !self.fresh.contains(&k)
         {
             self.fetch_issues(k);
         }
@@ -303,6 +378,13 @@ impl App {
             self.last_key = key.clone();
             self.key_changed_at = Instant::now();
             self.detail_scroll = 0;
+            if let Some(k) = &key {
+                self.mark_seen(std::slice::from_ref(k));
+            }
+        }
+        let mins = self.client.refresh_minutes();
+        if mins > 0 && self.last_refresh.elapsed() >= Duration::from_secs(mins * 60) {
+            self.refresh_all();
         }
         if let Some(k) = key
             && self.show_detail
@@ -317,12 +399,15 @@ impl App {
             Msg::Projects(Ok(p)) => {
                 self.loading_projects = false;
                 self.status = format!("{} projects", p.len());
-                self.projects = p;
-                self.sort_projects(None);
-                if !self.projects.is_empty() {
+                let keep = self.current_project().map(|p| p.key.clone());
+                self.cache.projects = p.clone();
+                self.projects = with_my_work(p);
+                self.sort_projects(keep);
+                if self.proj_state.selected().is_none() {
                     self.proj_state.select(Some(0));
-                    self.ensure_issues();
                 }
+                self.ensure_issues();
+                self.save_cache();
             }
             Msg::Projects(Err(e)) => {
                 self.loading_projects = false;
@@ -337,9 +422,23 @@ impl App {
                 match r {
                     Ok(list) => {
                         let keys: HashSet<_> = list.iter().map(|i| i.key.clone()).collect();
-                        self.marked.retain(|m| keys.contains(m));
+                        if self.current_project().is_some_and(|p| p.key == k) {
+                            self.marked.retain(|m| keys.contains(m));
+                        }
+                        // first load of a view: everything counts as seen
+                        let first = self.cache.baselined.insert(k.clone());
+                        for i in &list {
+                            if first || self.just_edited.remove(&i.key) {
+                                self.cache.seen.insert(i.key.clone(), i.updated.clone());
+                            }
+                        }
+                        let at = cache::now();
+                        self.cache.lists.insert(k.clone(), cache::CachedList { jql, issues: list.clone(), at });
+                        self.fetched_at.insert(k.clone(), at);
+                        self.fresh.insert(k.clone());
                         self.issues.insert(k, list);
                         self.clamp_issue();
+                        self.save_cache();
                     }
                     Err(e) => self.status = format!("Error ({k}): {e}"),
                 }
@@ -378,7 +477,7 @@ impl App {
                     }
                 }
             }
-            Msg::Applied { project, keys, ok, errs } => {
+            Msg::Applied { keys, ok, errs } => {
                 self.busy = false;
                 for k in &keys {
                     self.details.remove(k);
@@ -389,7 +488,8 @@ impl App {
                 } else {
                     format!("Error: {ok} ok, {} failed — {}", errs.len(), errs.join(" | "))
                 };
-                self.fetch_issues(project);
+                self.just_edited.extend(keys);
+                self.refresh_all();
                 self.last_key = None; // force detail reload
             }
         }
@@ -573,7 +673,9 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        let Some(project) = self.current_project().map(|p| p.key.clone()) else { return };
+        if self.current_project().is_none() {
+            return;
+        }
         self.popup_seq += 1;
         let id = self.popup_seq;
         self.popup = Some(Popup {
@@ -587,7 +689,7 @@ impl App {
             loading: true,
             error: None,
         });
-        self.spawn(move |c| Msg::Options(id, load_options(&c, kind, &targets, &project).map_err(|e| e.to_string())));
+        self.spawn(move |c| Msg::Options(id, load_options(&c, kind, &targets).map_err(|e| e.to_string())));
     }
 
     fn popup_key(&mut self, k: KeyEvent) {
@@ -624,7 +726,9 @@ impl App {
             self.set_sort(&opt.value);
             return;
         }
-        let Some(project) = self.current_project().map(|p| p.key.clone()) else { return };
+        if self.current_project().is_none() {
+            return;
+        }
         self.busy = true;
         self.status = format!("Updating {} issue(s)…", p.targets.len());
         let Popup { kind, targets, trans, .. } = p;
@@ -645,7 +749,7 @@ impl App {
                     Err(e) => errs.push(format!("{key}: {e}")),
                 }
             }
-            Msg::Applied { project, keys: targets, ok, errs }
+            Msg::Applied { keys: targets, ok, errs }
         });
     }
 
@@ -779,9 +883,15 @@ impl App {
                 }
             }
             KeyCode::Char('R') => {
-                self.issues.clear();
                 self.details.clear();
+                self.fresh.clear();
                 self.fetch_projects();
+                self.refresh_all();
+            }
+            KeyCode::Char('c') => {
+                let keys: Vec<String> = self.visible_issues().iter().map(|i| i.key.clone()).collect();
+                self.mark_seen(&keys);
+                self.save_cache();
             }
             KeyCode::Enter => match self.focus {
                 Pane::Projects => self.focus = Pane::Issues,
@@ -799,8 +909,9 @@ impl App {
     /// Pinned projects first (in pin order), then the rest; keeps `keep` selected.
     fn sort_projects(&mut self, keep: Option<String>) {
         let pins = &self.pinned;
-        self.projects
-            .sort_by_key(|p| pins.iter().position(|k| *k == p.key).unwrap_or(usize::MAX));
+        self.projects.sort_by_key(|p| {
+            if p.key == MY_WORK { 0 } else { pins.iter().position(|k| *k == p.key).map_or(usize::MAX, |i| i + 1) }
+        });
         if let Some(k) = keep {
             self.proj_state.select(self.projects.iter().position(|p| p.key == k));
         }
@@ -808,6 +919,9 @@ impl App {
 
     fn toggle_pin(&mut self) {
         let Some(key) = self.current_project().map(|p| p.key.clone()) else { return };
+        if key == MY_WORK {
+            return;
+        }
         if self.is_pinned(&key) {
             self.pinned.retain(|k| *k != key);
             self.status = format!("Unpinned {key}");
@@ -861,7 +975,7 @@ fn sel_step(state: &mut ListState, n: usize, d: isize) {
     state.select(Some((i + d).rem_euclid(n as isize) as usize));
 }
 
-fn load_options(c: &Client, kind: PopKind, targets: &[String], project: &str) -> anyhow::Result<(Vec<Opt>, TransMap)> {
+fn load_options(c: &Client, kind: PopKind, targets: &[String]) -> anyhow::Result<(Vec<Opt>, TransMap)> {
     let mut trans = TransMap::new();
     let opts = match kind {
         PopKind::Status => {
@@ -895,7 +1009,7 @@ fn load_options(c: &Client, kind: PopKind, targets: &[String], project: &str) ->
                 Opt { label: "Unassigned".into(), value: String::new() },
             ];
             v.extend(
-                c.assignable(project)?
+                c.assignable_multi(&projects_of(targets))?
                     .into_iter()
                     .filter(|(id, _)| *id != me_id)
                     .map(|(id, name)| Opt { label: name, value: id }),
@@ -915,19 +1029,41 @@ fn load_options(c: &Client, kind: PopKind, targets: &[String], project: &str) ->
 fn load_filter_opts(c: &Client, project: &str) -> anyhow::Result<FilterOpts> {
     let plain = |v: Vec<String>| v.into_iter().map(|n| Choice::new(n.clone(), n)).collect::<Vec<_>>();
     let mut o = FilterOpts::default();
-    let statuses = c.statuses(project)?;
+    let my_work = project == MY_WORK;
+    let statuses = if my_work { c.all_statuses()? } else { c.statuses(project)? };
     o.done = statuses.iter().filter(|(_, done)| *done).map(|(n, _)| n.clone()).collect();
     o.groups.insert(Group::Status, plain(statuses.into_iter().map(|(n, _)| n).collect()));
-    let (me_id, _) = c.myself()?;
-    let mut people = vec![Choice::new(filter::ME, "Me"), Choice::new(filter::NOBODY, "Unassigned")];
-    people.extend(
-        c.assignable(project)?
-            .into_iter()
-            .filter(|(id, _)| *id != me_id)
-            .map(|(id, name)| Choice::new(id, name)),
-    );
-    o.groups.insert(Group::Assignee, people);
+    if !my_work {
+        let (me_id, _) = c.myself()?;
+        let mut people = vec![Choice::new(filter::ME, "Me"), Choice::new(filter::NOBODY, "Unassigned")];
+        people.extend(
+            c.assignable(project)?
+                .into_iter()
+                .filter(|(id, _)| *id != me_id)
+                .map(|(id, name)| Choice::new(id, name)),
+        );
+        o.groups.insert(Group::Assignee, people);
+    }
     o.groups.insert(Group::Priority, plain(c.priorities()?.into_iter().map(|(_, n)| n).collect()));
-    o.groups.insert(Group::Type, plain(c.issue_types(project)?));
+    o.groups.insert(Group::Type, plain(if my_work { c.all_issue_types()? } else { c.issue_types(project)? }));
     Ok(o)
+}
+
+/// Prepend the "My work" pseudo-project.
+fn with_my_work(mut v: Vec<Project>) -> Vec<Project> {
+    v.retain(|p| p.key != MY_WORK);
+    v.insert(0, Project { key: MY_WORK.into(), name: "My work".into() });
+    v
+}
+
+/// Distinct project keys of issue keys ("ABC-12" -> "ABC").
+fn projects_of(keys: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for k in keys {
+        let p = k.rsplit_once('-').map_or(k.as_str(), |(p, _)| p).to_string();
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
 }

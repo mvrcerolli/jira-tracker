@@ -1,5 +1,5 @@
 use crate::app::{App, Pane, PopKind, SortCol};
-use crate::filter::Group;
+use crate::filter::{Group, MY_WORK};
 use crate::jira::{Cat, Detail};
 use ratatui::{
     Frame,
@@ -11,6 +11,7 @@ use ratatui::{
 
 const ACCENT: Color = Color::Cyan;
 const MARK: Color = Color::Magenta;
+const CHANGED: Color = Color::Yellow;
 
 fn block(title: String, focused: bool) -> Block<'static> {
     let b = Block::bordered().border_type(BorderType::Rounded).title(title);
@@ -79,13 +80,17 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 None if app.loading.contains_key(&p.key) => "…".into(),
                 None => String::new(),
             };
+            let changed = app.changed_count(&p.key);
+            let changed = if changed > 0 { format!("+{changed} ") } else { String::new() };
+            let my_work = p.key == MY_WORK;
             let pin = match app.pinned.iter().position(|k| *k == p.key) {
+                _ if my_work => "◎ ".into(),
                 Some(i) if i < 9 => format!("{} ", i + 1),
                 Some(_) => "★ ".into(),
                 None => "  ".into(),
             };
-            let key = format!("{:<8}", p.key);
-            let used = 2 + key.chars().count() + 1 + count.chars().count();
+            let key = if my_work { String::new() } else { format!("{:<8}", p.key) };
+            let used = 2 + key.chars().count() + 1 + changed.chars().count() + count.chars().count();
             let room = width.saturating_sub(used);
             let mut name: String = p.name.chars().take(room).collect();
             if p.name.chars().count() > room && room > 0 {
@@ -93,11 +98,13 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 name.push('…');
             }
             let pad = room.saturating_sub(name.chars().count()) + 1;
+            let name_style = if my_work { Style::new().fg(ACCENT).bold() } else { Style::new() };
             ListItem::new(Line::from(vec![
-                Span::styled(pin, Style::new().fg(Color::Yellow)),
+                Span::styled(pin, Style::new().fg(if my_work { ACCENT } else { Color::Yellow })),
                 Span::styled(key, Style::new().bold()),
-                Span::raw(name),
+                Span::styled(name, name_style),
                 Span::raw(" ".repeat(pad)),
+                Span::styled(changed, Style::new().fg(CHANGED).bold()),
                 Span::styled(count, Style::new().fg(Color::Yellow)),
             ]))
         })
@@ -112,14 +119,24 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_issues(f: &mut Frame, app: &mut App, area: Rect) {
+    let baselined = app.current_project().is_some_and(|p| app.cache.baselined.contains(&p.key));
     let issues = app.visible_issues();
     let rows: Vec<Row> = issues
         .iter()
         .map(|i| {
             let marked = app.marked.contains(&i.key);
+            let changed = baselined && app.is_changed(i);
+            let (sym, sym_color) = if marked {
+                ("●", MARK)
+            } else if changed {
+                ("◆", CHANGED)
+            } else {
+                (" ", MARK)
+            };
+            let key_cell = Cell::from(i.key.clone()).bold();
             let row = Row::new(vec![
-                Cell::from(if marked { "●" } else { " " }).fg(MARK),
-                Cell::from(i.key.clone()).bold(),
+                Cell::from(sym).fg(sym_color),
+                if changed { key_cell.fg(CHANGED) } else { key_cell },
                 Cell::from(i.status.clone()).fg(cat_color(&i.cat)),
                 Cell::from(i.priority.clone()).fg(prio_color(&i.priority)),
                 Cell::from(i.assignee.clone()),
@@ -134,7 +151,14 @@ fn draw_issues(f: &mut Frame, app: &mut App, area: Rect) {
         None => (String::new(), false),
     };
     let fdesc = app.filter_for(&pkey).short();
-    let mut title = format!(" {pkey} issues ({n}{}) · {fdesc} ", if n >= crate::filter::MAX_ISSUES { "+" } else { "" });
+    let label = if pkey == MY_WORK { "My work" } else { pkey.as_str() };
+    let more = if n >= crate::filter::MAX_ISSUES { "+" } else { "" };
+    let mut title = format!(" {label} issues ({n}{more}) · {fdesc} ");
+    if !app.fresh.contains(&pkey)
+        && let Some(at) = app.fetched_at.get(&pkey)
+    {
+        title.push_str(&format!("· cached {} ", crate::cache::ago(*at)));
+    }
     if !app.marked.is_empty() {
         title.push_str(&format!("· {} marked ", app.marked.len()));
     }
@@ -334,6 +358,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("Other", &[
         ("*", "pin / unpin project"),
+        ("c", "mark all listed issues as seen (clears ◆)"),
         ("r", "refresh project"),
         ("R", "reload everything"),
         ("Ctrl+c", "quit"),
@@ -353,6 +378,7 @@ fn draw_help(f: &mut Frame) {
         lines.push(Line::raw(""));
     }
     lines.push(Line::from("Edits apply to marked issues, or the selected one if none.".dark_gray()));
+    lines.push(Line::from("◆ = new/changed since you last looked · ◎ My work = assigned to me".dark_gray()));
     lines.push(Line::from("Press any key to close".dark_gray()));
 
     let area = f.area();
@@ -381,7 +407,7 @@ fn draw_filter(f: &mut Frame, app: &mut App) {
     let outer = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(ACCENT))
-        .title(format!(" Filters · {} ", fp.project))
+        .title(format!(" Filters · {} ", if fp.project == MY_WORK { "My work" } else { fp.project.as_str() }))
         .title_bottom(Line::from(" Enter apply · Esc cancel ".dark_gray()).right_aligned());
     let inner = outer.inner(r);
     f.render_widget(outer, r);

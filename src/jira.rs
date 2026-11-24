@@ -3,7 +3,7 @@ use anyhow::{Result, bail};
 use reqwest::Method;
 use reqwest::blocking::{Client as Http, Response};
 use serde_json::{Value, json};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct Client {
@@ -11,20 +11,20 @@ pub struct Client {
     cfg: Config,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Project {
     pub key: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Cat {
     Todo,
     Doing,
     Done,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Issue {
     pub key: String,
     pub summary: String,
@@ -32,6 +32,9 @@ pub struct Issue {
     pub cat: Cat,
     pub assignee: String,
     pub priority: String,
+    /// Raw Jira timestamp; used to detect changes.
+    #[serde(default)]
+    pub updated: String,
 }
 
 // --- raw API shapes ---
@@ -62,6 +65,7 @@ struct RawFields {
     status: Option<RawStatus>,
     assignee: Option<Named>,
     priority: Option<NameOnly>,
+    updated: Option<String>,
 }
 #[derive(Deserialize)]
 struct NameOnly {
@@ -104,6 +108,7 @@ impl From<RawIssue> for Issue {
             cat,
             assignee: f.assignee.map(|a| a.display_name).unwrap_or_else(|| "—".into()),
             priority: f.priority.map(|p| p.name).unwrap_or_default(),
+            updated: f.updated.unwrap_or_default(),
         }
     }
 }
@@ -114,6 +119,14 @@ impl Client {
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
         Ok(Self { http, cfg })
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.cfg.base_url
+    }
+
+    pub fn refresh_minutes(&self) -> u64 {
+        self.cfg.refresh_minutes
     }
 
     pub fn browse_url(&self, key: &str) -> String {
@@ -192,7 +205,7 @@ impl Client {
         loop {
             let mut q = vec![
                 ("jql", jql.clone()),
-                ("fields", "summary,status,assignee,priority".into()),
+                ("fields", "summary,status,assignee,priority,updated".into()),
                 ("maxResults", "100".into()),
             ];
             if let Some(t) = &token {
@@ -247,6 +260,39 @@ impl Client {
         Ok(out.into_iter().map(|(r, n)| (n, r == 2)).collect())
     }
 
+    /// All statuses on the site: (name, is Done category), To Do → Done.
+    pub fn all_statuses(&self) -> Result<Vec<(String, bool)>> {
+        let v: Vec<Value> = self.get("/rest/api/3/status", &[])?;
+        let mut out: Vec<(u8, String)> = vec![];
+        for st in &v {
+            let name = s(&st["name"]);
+            let rank = match st["statusCategory"]["key"].as_str() {
+                Some("indeterminate") => 1,
+                Some("done") => 2,
+                _ => 0,
+            };
+            if !out.iter().any(|(_, n)| *n == name) {
+                out.push((rank, name));
+            }
+        }
+        out.sort_by_key(|(r, _)| *r);
+        Ok(out.into_iter().map(|(r, n)| (n, r == 2)).collect())
+    }
+
+    /// All issue type names on the site.
+    pub fn all_issue_types(&self) -> Result<Vec<String>> {
+        let v: Vec<Value> = self.get("/rest/api/3/issuetype", &[])?;
+        let mut out: Vec<String> = vec![];
+        for t in &v {
+            let n = s(&t["name"]);
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// Issue type names of a project.
     pub fn issue_types(&self, project: &str) -> Result<Vec<String>> {
         let v: Value = self.get(&format!("/rest/api/3/project/{project}"), &[])?;
@@ -293,6 +339,21 @@ impl Client {
         let v: Vec<Value> = self.get(
             "/rest/api/3/user/assignable/search",
             &[("project", project.into()), ("maxResults", "1000".into())],
+        )?;
+        let mut out: Vec<_> = v
+            .iter()
+            .filter(|u| u["active"].as_bool().unwrap_or(true))
+            .map(|u| (s(&u["accountId"]), s(&u["displayName"])))
+            .collect();
+        out.sort_by_key(|(_, n)| n.to_lowercase());
+        Ok(out)
+    }
+
+    /// (accountId, displayName) of users assignable in all of these projects.
+    pub fn assignable_multi(&self, projects: &[String]) -> Result<Vec<(String, String)>> {
+        let v: Vec<Value> = self.get(
+            "/rest/api/3/user/assignable/multiProjectSearch",
+            &[("projectKeys", projects.join(",")), ("maxResults", "1000".into())],
         )?;
         let mut out: Vec<_> = v
             .iter()

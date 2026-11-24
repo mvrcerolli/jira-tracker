@@ -11,12 +11,20 @@ pub struct Config {
     /// Optional: only show these project keys (in this order).
     #[serde(default)]
     pub projects: Vec<String>,
+    /// Auto-refresh interval in minutes (0 = off).
+    #[serde(default = "default_refresh")]
+    pub refresh_minutes: u64,
+}
+
+fn default_refresh() -> u64 {
+    5
 }
 
 pub const EXAMPLE: &str = r#"base_url  = "https://your-site.atlassian.net"
 email     = "you@example.com"
 api_token = "..."            # or set JIRA_API_TOKEN
 # projects = ["ABC", "XYZ"]  # optional: limit/pin projects
+# refresh_minutes = 5        # auto-refresh interval, 0 = off
 "#;
 
 pub fn path() -> PathBuf {

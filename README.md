@@ -12,6 +12,7 @@ A fast terminal UI for Jira Cloud: projects on the left, issues on the right, no
    email     = "you@example.com"
    api_token = "..."            # or set JIRA_API_TOKEN
    # projects = ["ABC", "XYZ"]  # optional: only show these projects
+   # refresh_minutes = 5        # auto-refresh interval, 0 = off
    ```
 
 3. Install and run:
@@ -40,8 +41,13 @@ Press `?` inside jt for the full list.
 | `Space`, `Ctrl+a` | mark issue / all |
 | `s` / `a` / `p` | change status / assignee / priority (marked issues or selected) |
 | `z` | show / hide projects |
+| `c` | mark listed issues as seen (clears `◆`) |
 | `r` / `R` | refresh project / everything |
 | `Ctrl+c` | quit |
+
+- **◎ My work** (top of the sidebar): everything assigned to you across all projects.
+- **Cache:** jt opens instantly with the last data (`~/.cache/jt/cache.json`, `%LOCALAPPDATA%\jt\cache.json` on Windows) and refreshes in the background.
+- **Auto-refresh** every `refresh_minutes` (default 5). Issues new or changed since you last looked show `◆`; the sidebar shows `+N` per project. Moving the cursor onto an issue marks it seen.
 
 Pins and filters are stored next to the config (`pinned.txt`, `filters.toml`).
 
