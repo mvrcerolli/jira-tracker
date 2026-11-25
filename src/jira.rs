@@ -35,6 +35,11 @@ pub struct Issue {
     /// Raw Jira timestamp; used to detect changes.
     #[serde(default)]
     pub updated: String,
+    #[serde(default)]
+    pub issuetype: String,
+    /// accountId ("" = unassigned)
+    #[serde(default)]
+    pub assignee_id: String,
 }
 
 // --- raw API shapes ---
@@ -66,6 +71,7 @@ struct RawFields {
     assignee: Option<Named>,
     priority: Option<NameOnly>,
     updated: Option<String>,
+    issuetype: Option<NameOnly>,
 }
 #[derive(Deserialize)]
 struct NameOnly {
@@ -85,6 +91,8 @@ struct RawCat {
 struct Named {
     #[serde(rename = "displayName")]
     display_name: String,
+    #[serde(rename = "accountId", default)]
+    account_id: String,
 }
 
 impl From<RawIssue> for Issue {
@@ -106,7 +114,9 @@ impl From<RawIssue> for Issue {
             summary: f.summary.unwrap_or_default(),
             status,
             cat,
+            assignee_id: f.assignee.as_ref().map(|a| a.account_id.clone()).unwrap_or_default(),
             assignee: f.assignee.map(|a| a.display_name).unwrap_or_else(|| "—".into()),
+            issuetype: f.issuetype.map(|t| t.name).unwrap_or_default(),
             priority: f.priority.map(|p| p.name).unwrap_or_default(),
             updated: f.updated.unwrap_or_default(),
         }
@@ -209,7 +219,7 @@ impl Client {
         loop {
             let mut q = vec![
                 ("jql", jql.clone()),
-                ("fields", "summary,status,assignee,priority,updated".into()),
+                ("fields", "summary,status,assignee,priority,updated,issuetype".into()),
                 ("maxResults", "100".into()),
             ];
             if let Some(t) = &token {
@@ -402,14 +412,14 @@ fn date(v: &Value) -> String {
     v.as_str().map(|d| d.chars().take(16).collect::<String>().replace('T', " ")).unwrap_or_default()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Comment {
     pub author: String,
     pub created: String,
     pub body: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Detail {
     pub key: String,
     pub summary: String,

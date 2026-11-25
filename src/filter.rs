@@ -68,7 +68,7 @@ impl From<Filter> for RawFilter {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum Group {
     Status,
     Assignee,
@@ -91,7 +91,7 @@ impl Group {
 }
 
 /// Available choices for one project.
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct FilterOpts {
     pub groups: HashMap<Group, Vec<Choice>>,
     /// Status names in the Done category.
@@ -215,6 +215,51 @@ impl Filter {
                 .map(|g| g.name()),
         );
         if parts.is_empty() { "all".into() } else { parts.join(", ") }
+    }
+
+    /// Evaluate the filter locally. `None` when it can't be decided offline
+    /// (custom JQL, or data the cached issue doesn't carry).
+    pub fn matches(&self, i: &crate::jira::Issue, me: Option<&str>) -> Option<bool> {
+        if !self.jql.trim().is_empty() {
+            return None;
+        }
+        let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+        let status_ok = match &self.statuses {
+            None => i.cat != crate::jira::Cat::Done,
+            Some(v) if v.is_empty() => true,
+            Some(v) => v.iter().any(|c| eq(&c.value, &i.status)),
+        };
+        if !status_ok {
+            return Some(false);
+        }
+        if !self.assignees.is_empty() {
+            if i.assignee_id.is_empty() && i.assignee != "—" {
+                return None; // old cache entry without accountId
+            }
+            let mut ok = false;
+            for c in &self.assignees {
+                ok |= match c.value.as_str() {
+                    ME => i.assignee_id == me?,
+                    NOBODY => i.assignee_id.is_empty(),
+                    id => i.assignee_id == id,
+                };
+            }
+            if !ok {
+                return Some(false);
+            }
+        }
+        if !self.priorities.is_empty() && !self.priorities.iter().any(|c| eq(&c.value, &i.priority)) {
+            return Some(false);
+        }
+        if !self.types.is_empty() {
+            if i.issuetype.is_empty() {
+                return None;
+            }
+            if !self.types.iter().any(|c| eq(&c.value, &i.issuetype)) {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
     pub fn to_jql(&self, project: &str) -> String {
@@ -357,6 +402,38 @@ mod tests {
             Filter::default().to_jql(MY_WORK),
             "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
         );
+    }
+
+    #[test]
+    fn local_matching() {
+        use crate::jira::{Cat, Issue};
+        let issue = |status: &str, cat: Cat, aid: &str, prio: &str, ty: &str| Issue {
+            key: "EE-1".into(),
+            summary: String::new(),
+            status: status.into(),
+            cat,
+            assignee: if aid.is_empty() { "—".into() } else { "X".into() },
+            priority: prio.into(),
+            updated: String::new(),
+            issuetype: ty.into(),
+            assignee_id: aid.into(),
+        };
+        let todo = issue("To Do", Cat::Todo, "me1", "High", "Bug");
+        let done = issue("Done", Cat::Done, "", "Low", "Task");
+        let d = Filter::default();
+        assert_eq!(d.matches(&todo, None), Some(true));
+        assert_eq!(d.matches(&done, None), Some(false));
+        let f = Filter {
+            statuses: Some(vec![]),
+            assignees: vec![Choice::new(ME, "Me")],
+            types: vec![Choice::new("bug", "Bug")],
+            ..Default::default()
+        };
+        assert_eq!(f.matches(&todo, Some("me1")), Some(true));
+        assert_eq!(f.matches(&todo, None), None); // my id unknown
+        assert_eq!(f.matches(&done, Some("me1")), Some(false));
+        let j = Filter { jql: "labels = x".into(), ..Default::default() };
+        assert_eq!(j.matches(&todo, None), None);
     }
 
     #[test]

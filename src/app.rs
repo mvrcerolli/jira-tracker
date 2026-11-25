@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 type Res<T> = Result<T, String>;
 /// issue key -> (transition name -> transition id)
-type TransMap = HashMap<String, HashMap<String, String>>;
+pub type TransMap = HashMap<String, HashMap<String, String>>;
 
 pub enum Msg {
     Projects(Res<Vec<Project>>),
@@ -21,8 +21,10 @@ pub enum Msg {
     FilterOpts(String, Res<FilterOpts>),
     Prs(String, Res<Vec<Pr>>),
     Detail(String, Res<Box<Detail>>),
-    Options(u64, Res<(Vec<Opt>, TransMap)>),
-    Applied { keys: Vec<String>, ok: usize, errs: Vec<String> },
+    /// popup id, options cache key, result
+    Options(u64, String, Res<(Vec<Opt>, TransMap)>),
+    Me(Res<(String, String)>),
+    Applied { keys: Vec<String>, ok_keys: Vec<String>, edit: Edit, errs: Vec<String> },
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -88,11 +90,29 @@ fn prio_rank(p: &str) -> u8 {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Opt {
     pub label: String,
     /// Status: transition name · Assignee: accountId ("" = unassigned) · Priority: id
     pub value: String,
+    /// Status: the status the transition leads to
+    #[serde(default)]
+    pub extra: String,
+}
+
+impl Opt {
+    fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self { label: label.into(), value: value.into(), extra: String::new() }
+    }
+}
+
+/// A successful edit, applied locally right away (before the refetch).
+#[derive(Clone)]
+pub enum Edit {
+    Status(String),
+    Assignee { id: String, name: String },
+    Priority(String),
+    None,
 }
 
 pub struct Popup {
@@ -126,6 +146,9 @@ pub struct App {
     pub filter_opts: HashMap<String, FilterOpts>,
     filter_opts_loading: HashSet<String>,
     pub fpanel: Option<FilterPanel>,
+    filter_opts_fresh: HashSet<String>,
+    dirty: bool,
+    last_save: Instant,
     pub cache: Cache,
     gh: GitHub,
     pub prs: HashMap<String, Vec<Pr>>,
@@ -178,6 +201,9 @@ impl App {
             filter_opts: HashMap::new(),
             filter_opts_loading: HashSet::new(),
             fpanel: None,
+            filter_opts_fresh: HashSet::new(),
+            dirty: false,
+            last_save: Instant::now(),
             cache: Cache::default(),
             gh: GitHub::new(gh_token).expect("http client"),
             prs: HashMap::new(),
@@ -224,25 +250,33 @@ impl App {
         self.projects = with_my_work(self.cache.projects.clone());
         self.sort_projects(None);
         self.proj_state.select(Some(0));
-        let lists: Vec<(String, cache::CachedList)> =
-            self.cache.lists.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        for (view, l) in lists {
-            if l.jql == self.filter_for(&view).to_jql(&view) {
-                self.fetched_at.insert(view.clone(), l.at);
-                self.issues.insert(view, l.issues);
+        let lists: Vec<cache::CachedList> = self.cache.lists.values().cloned().collect();
+        for l in lists {
+            if l.jql == self.filter_for(&l.view).to_jql(&l.view) {
+                self.fetched_at.insert(l.view.clone(), l.at);
+                self.issues.insert(l.view, l.issues);
             }
         }
         self.prs = self.cache.prs.clone();
+        self.filter_opts = self.cache.filter_opts.clone();
+        self.details = self.cache.details.clone();
+        if self.cache.me.is_none() {
+            self.spawn(|c| Msg::Me(c.myself().map_err(|e| e.to_string())));
+        }
         self.clamp_issue();
     }
 
     pub fn save_cache(&mut self) {
         // forget "seen" entries for issues no longer in any cached list
-        let live: HashSet<&String> = self.cache.lists.values().flat_map(|l| l.issues.iter().map(|i| &i.key)).collect();
+        let live: HashSet<String> =
+            self.cache.lists.values().flat_map(|l| l.issues.iter().map(|i| i.key.clone())).collect();
         let seen: HashMap<String, String> =
-            self.cache.seen.iter().filter(|(k, _)| live.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+            self.cache.seen.iter().filter(|(k, _)| live.contains(*k)).map(|(k, v)| (k.clone(), v.clone())).collect();
         self.cache.seen = seen;
-        cache::save(&self.cache);
+        self.cache.details.retain(|k, _| live.contains(k));
+        cache::save(&mut self.cache);
+        self.dirty = false;
+        self.last_save = Instant::now();
     }
 
     /// New or updated since the user last looked at it.
@@ -365,7 +399,7 @@ impl App {
     }
 
     fn fetch_filter_opts(&mut self, project: String) {
-        if self.filter_opts.contains_key(&project) || !self.filter_opts_loading.insert(project.clone()) {
+        if self.filter_opts_fresh.contains(&project) || !self.filter_opts_loading.insert(project.clone()) {
             return;
         }
         self.spawn(move |c| {
@@ -449,6 +483,9 @@ impl App {
                 self.mark_seen(std::slice::from_ref(k));
             }
         }
+        if self.dirty && self.last_save.elapsed() > Duration::from_secs(3) {
+            self.save_cache();
+        }
         let mins = self.client.refresh_minutes();
         if mins > 0 && self.last_refresh.elapsed() >= Duration::from_secs(mins * 60) {
             self.refresh_all();
@@ -474,7 +511,7 @@ impl App {
                     self.proj_state.select(Some(0));
                 }
                 self.ensure_issues();
-                self.save_cache();
+                self.dirty = true;
             }
             Msg::Projects(Err(e)) => {
                 self.loading_projects = false;
@@ -505,16 +542,17 @@ impl App {
                             for i in &list {
                                 if before.get(&i.key) != Some(&&i.updated) {
                                     self.details.remove(&i.key);
+                                    self.cache.details.remove(&i.key);
                                 }
                             }
                         }
                         let at = cache::now();
-                        self.cache.lists.insert(k.clone(), cache::CachedList { jql, issues: list.clone(), at });
+                        self.cache.lists.insert(jql.clone(), cache::CachedList { view: k.clone(), jql, issues: list.clone(), at });
                         self.fetched_at.insert(k.clone(), at);
                         self.fresh.insert(k.clone());
                         self.issues.insert(k, list);
                         self.clamp_issue();
-                        self.save_cache();
+                        self.dirty = true;
                     }
                     Err(e) => self.status = format!("Error ({k}): {e}"),
                 }
@@ -530,7 +568,7 @@ impl App {
                         let n = self.visible_prs().len();
                         let sel = self.pr_state.selected().map(|i| i.min(n.saturating_sub(1)));
                         self.pr_state.select(if n == 0 { None } else { sel.or(Some(0)) });
-                        self.save_cache();
+                        self.dirty = true;
                     }
                     Err(e) => {
                         self.pr_errors.insert(k, e);
@@ -541,7 +579,10 @@ impl App {
                 self.filter_opts_loading.remove(&k);
                 match r {
                     Ok(o) => {
+                        self.cache.filter_opts.insert(k.clone(), o.clone());
+                        self.filter_opts_fresh.insert(k.clone());
                         self.filter_opts.insert(k, o);
+                        self.dirty = true;
                     }
                     Err(e) => self.status = format!("Error (filters): {e}"),
                 }
@@ -550,29 +591,50 @@ impl App {
                 self.detail_loading.remove(&k);
                 match r {
                     Ok(d) => {
+                        self.cache.details.insert(k.clone(), (*d).clone());
                         self.details.insert(k, *d);
+                        self.dirty = true;
                     }
                     Err(e) => self.status = format!("Error ({k}): {e}"),
                 }
             }
-            Msg::Options(id, r) => {
+            Msg::Options(id, key, r) => {
+                if let Ok(v) = &r {
+                    self.cache.options.insert(key, v.clone());
+                    self.dirty = true;
+                }
                 if let Some(p) = self.popup.as_mut().filter(|p| p.id == id) {
+                    let had_cached = !p.loading;
                     p.loading = false;
                     match r {
                         Ok((opts, trans)) => {
+                            // keep the highlighted choice when fresh options replace cached ones
+                            let sel = p.state.selected().and_then(|i| p.visible().get(i).map(|o| o.label.clone()));
                             p.opts = opts;
                             p.trans = trans;
-                            p.state.select(if p.opts.is_empty() { None } else { Some(0) });
+                            p.error = None;
+                            let vis = p.visible();
+                            let idx = sel.and_then(|l| vis.iter().position(|o| o.label == l)).or(Some(0));
+                            p.state.select(if vis.is_empty() { None } else { idx });
                             if p.opts.is_empty() {
                                 p.error = Some("No options available".into());
                             }
                         }
+                        Err(e) if had_cached => self.status = format!("Error: couldn't refresh options: {e}"),
                         Err(e) => p.error = Some(e),
                     }
                 }
             }
-            Msg::Applied { keys, ok, errs } => {
+            Msg::Me(r) => {
+                if let Ok(me) = r {
+                    self.cache.me = Some(me);
+                    self.dirty = true;
+                }
+            }
+            Msg::Applied { keys, ok_keys, edit, errs } => {
                 self.busy = false;
+                let ok = ok_keys.len();
+                self.apply_local(&ok_keys, &edit);
                 for k in &keys {
                     self.details.remove(k);
                 }
@@ -585,6 +647,36 @@ impl App {
                 self.just_edited.extend(keys);
                 self.refresh_all();
                 self.last_key = None; // force detail reload
+            }
+        }
+    }
+
+    /// Reflect a successful edit in every loaded list immediately.
+    fn apply_local(&mut self, keys: &[String], edit: &Edit) {
+        let done: HashSet<String> = self.filter_opts.values().flat_map(|o| o.done.iter().cloned()).collect();
+        let known: HashSet<String> = self
+            .filter_opts
+            .values()
+            .flat_map(|o| o.groups.get(&Group::Status).into_iter().flatten().map(|c| c.value.clone()))
+            .collect();
+        for list in self.issues.values_mut() {
+            for i in list.iter_mut().filter(|i| keys.contains(&i.key)) {
+                match edit {
+                    Edit::Status(to) if !to.is_empty() => {
+                        i.status = to.clone();
+                        if done.contains(to) {
+                            i.cat = crate::jira::Cat::Done;
+                        } else if known.contains(to) && i.cat == crate::jira::Cat::Done {
+                            i.cat = crate::jira::Cat::Todo;
+                        }
+                    }
+                    Edit::Assignee { id, name } => {
+                        i.assignee_id = id.clone();
+                        i.assignee = name.clone();
+                    }
+                    Edit::Priority(p) => i.priority = p.clone(),
+                    _ => {}
+                }
             }
         }
     }
@@ -716,10 +808,41 @@ impl App {
         if let Err(e) = filter::save(&self.filters) {
             self.status = format!("Error: saving filters: {e}");
         }
-        self.issues.remove(&fp.project);
+        let view = fp.project;
+        let jql = self.filter_for(&view).to_jql(&view);
+        if let Some(l) = self.cache.lists.get(&jql).cloned() {
+            // used this filter before: show that list right away
+            self.fetched_at.insert(view.clone(), l.at);
+            self.issues.insert(view.clone(), l.issues);
+        } else if let Some(preview) = self.local_preview(&view) {
+            self.issues.insert(view.clone(), preview);
+        } // else: keep the current list until Jira answers
+        self.fresh.remove(&view);
         self.marked.clear();
         self.issue_state.select(None);
-        self.fetch_issues(fp.project);
+        self.clamp_issue();
+        self.fetch_issues(view);
+    }
+
+    /// Everything cached for a view, filtered locally with its current filter.
+    fn local_preview(&self, view: &str) -> Option<Vec<Issue>> {
+        let f = self.filter_for(view);
+        let me = self.cache.me.as_ref().map(|(id, _)| id.as_str());
+        let mut pool: HashMap<String, (u64, Issue)> = HashMap::new();
+        for l in self.cache.lists.values().filter(|l| l.view == view) {
+            for i in &l.issues {
+                if pool.get(&i.key).is_none_or(|(at, _)| *at < l.at) {
+                    pool.insert(i.key.clone(), (l.at, i.clone()));
+                }
+            }
+        }
+        let mut out = vec![];
+        for (_, i) in pool.into_values() {
+            if f.matches(&i, me)? {
+                out.push(i);
+            }
+        }
+        Some(out)
     }
 
     fn open_sort(&mut self) {
@@ -732,7 +855,7 @@ impl App {
                 } else {
                     c.name().to_string()
                 };
-                Opt { label, value: c.name().to_string() }
+                Opt::new(label, c.name())
             })
             .collect();
         let cur = SortCol::ALL.iter().position(|c| *c == self.sort_col);
@@ -781,18 +904,43 @@ impl App {
         }
         self.popup_seq += 1;
         let id = self.popup_seq;
+        let key = self.options_key(kind, &targets);
+        let cached = self.cache.options.get(&key).cloned();
+        let mut state = ListState::default();
+        if cached.as_ref().is_some_and(|(o, _)| !o.is_empty()) {
+            state.select(Some(0));
+        }
+        let (opts, trans) = cached.clone().unwrap_or_default();
         self.popup = Some(Popup {
             id,
             kind,
             targets: targets.clone(),
-            opts: vec![],
-            trans: HashMap::new(),
+            opts,
+            trans,
             filter: String::new(),
-            state: ListState::default(),
-            loading: true,
+            state,
+            loading: cached.is_none(),
             error: None,
         });
-        self.spawn(move |c| Msg::Options(id, load_options(&c, kind, &targets).map_err(|e| e.to_string())));
+        // always refresh in the background; cached choices are shown meanwhile
+        self.spawn(move |c| Msg::Options(id, key, load_options(&c, kind, &targets).map_err(|e| e.to_string())));
+    }
+
+    /// Cache key for edit-popup choices. Transitions depend on each issue's current status.
+    fn options_key(&self, kind: PopKind, targets: &[String]) -> String {
+        match kind {
+            PopKind::Priority => "priority".into(),
+            PopKind::Assignee => format!("assignee:{}", projects_of(targets).join(",")),
+            PopKind::Status => {
+                let status = |k: &String| {
+                    self.issues.values().flatten().find(|i| &i.key == k).map(|i| i.status.clone()).unwrap_or_default()
+                };
+                let mut parts: Vec<String> = targets.iter().map(|k| format!("{k}@{}", status(k))).collect();
+                parts.sort();
+                format!("status:{}", parts.join(","))
+            }
+            PopKind::Sort => String::new(),
+        }
     }
 
     fn popup_key(&mut self, k: KeyEvent) {
@@ -835,8 +983,23 @@ impl App {
         self.busy = true;
         self.status = format!("Updating {} issue(s)…", p.targets.len());
         let Popup { kind, targets, trans, .. } = p;
+        let edit = match kind {
+            PopKind::Status => Edit::Status(opt.extra.clone()),
+            PopKind::Assignee => {
+                let name = if opt.value.is_empty() {
+                    "—".to_string()
+                } else if let Some(n) = opt.label.strip_prefix("Me (").and_then(|l| l.strip_suffix(')')) {
+                    n.to_string()
+                } else {
+                    opt.label.clone()
+                };
+                Edit::Assignee { id: opt.value.clone(), name }
+            }
+            PopKind::Priority => Edit::Priority(opt.label.clone()),
+            PopKind::Sort => Edit::None,
+        };
         self.spawn(move |c| {
-            let (mut ok, mut errs) = (0, vec![]);
+            let (mut ok_keys, mut errs) = (vec![], vec![]);
             for key in &targets {
                 let r = match kind {
                     PopKind::Status => match trans.get(key).and_then(|m| m.get(&opt.value)) {
@@ -848,11 +1011,11 @@ impl App {
                     PopKind::Sort => Ok(()),
                 };
                 match r {
-                    Ok(()) => ok += 1,
+                    Ok(()) => ok_keys.push(key.clone()),
                     Err(e) => errs.push(format!("{key}: {e}")),
                 }
             }
-            Msg::Applied { keys: targets, ok, errs }
+            Msg::Applied { keys: targets, ok_keys, edit, errs }
         });
     }
 
@@ -1003,7 +1166,7 @@ impl App {
             KeyCode::Char('c') => {
                 let keys: Vec<String> = self.visible_issues().iter().map(|i| i.key.clone()).collect();
                 self.mark_seen(&keys);
-                self.save_cache();
+                self.dirty = true;
             }
             KeyCode::Enter => match self.focus {
                 Pane::Projects => self.focus = Pane::Issues,
@@ -1093,7 +1256,7 @@ fn load_options(c: &Client, kind: PopKind, targets: &[String]) -> anyhow::Result
     let opts = match kind {
         PopKind::Status => {
             // Only offer transitions available for every target issue.
-            let mut common: Option<Vec<(String, String)>> = None; // (name, label)
+            let mut common: Option<Vec<(String, String, String)>> = None; // (name, label, to)
             for key in targets {
                 let ts = c.transitions(key)?;
                 let names: HashSet<&String> = ts.iter().map(|t| &t.1).collect();
@@ -1102,30 +1265,30 @@ fn load_options(c: &Client, kind: PopKind, targets: &[String]) -> anyhow::Result
                         .iter()
                         .map(|(_, name, to)| {
                             let label = if name == to { name.clone() } else { format!("{name}  → {to}") };
-                            (name.clone(), label)
+                            (name.clone(), label, to.clone())
                         })
                         .collect(),
-                    Some(prev) => prev.into_iter().filter(|(n, _)| names.contains(n)).collect(),
+                    Some(prev) => prev.into_iter().filter(|(n, _, _)| names.contains(n)).collect(),
                 });
                 trans.insert(key.clone(), ts.into_iter().map(|(id, name, _)| (name, id)).collect());
             }
             common
                 .unwrap_or_default()
                 .into_iter()
-                .map(|(value, label)| Opt { label, value })
+                .map(|(value, label, to)| Opt { label, value, extra: to })
                 .collect()
         }
         PopKind::Assignee => {
             let (me_id, me_name) = c.myself()?;
             let mut v = vec![
-                Opt { label: format!("Me ({me_name})"), value: me_id.clone() },
-                Opt { label: "Unassigned".into(), value: String::new() },
+                Opt::new(format!("Me ({me_name})"), me_id.clone()),
+                Opt::new("Unassigned", ""),
             ];
             v.extend(
                 c.assignable_multi(&projects_of(targets))?
                     .into_iter()
                     .filter(|(id, _)| *id != me_id)
-                    .map(|(id, name)| Opt { label: name, value: id }),
+                    .map(|(id, name)| Opt::new(name, id)),
             );
             v
         }
@@ -1133,7 +1296,7 @@ fn load_options(c: &Client, kind: PopKind, targets: &[String]) -> anyhow::Result
         PopKind::Priority => c
             .priorities()?
             .into_iter()
-            .map(|(id, name)| Opt { label: name, value: id })
+            .map(|(id, name)| Opt::new(name, id))
             .collect(),
     };
     Ok((opts, trans))
