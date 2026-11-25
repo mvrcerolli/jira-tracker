@@ -1303,7 +1303,8 @@ impl App {
                         self.details.remove(&i);
                         self.last_key = None;
                     }
-                    self.fetch_issues(k);
+                    self.fetch_issues(k.clone());
+                    self.fetch_prs(k);
                 }
             }
             KeyCode::Char('R') => {

@@ -49,7 +49,7 @@ Press `?` inside jt for the full list.
 | `s` / `a` / `p` | change status / assignee / priority (marked issues or selected) |
 | `z` | show / hide projects |
 | `c` | mark listed issues as seen (clears `◆`) |
-| `r` / `R` | refresh project / everything |
+| `r` / `R` | refresh project + PRs / everything |
 | `Ctrl+c` | quit |
 
 - **◎ My work** (top of the sidebar): everything assigned to you across all projects.

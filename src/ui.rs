@@ -369,7 +369,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ("Other", &[
         ("*", "pin / unpin project"),
         ("c", "mark all listed issues as seen (clears ◆)"),
-        ("r", "refresh project"),
+        ("r", "refresh project + PRs"),
         ("R", "reload everything"),
         ("Ctrl+c", "quit"),
     ]),
