@@ -18,13 +18,38 @@ pub enum Msg {
     Projects(Res<Vec<Project>>),
     /// project, jql used, result
     Issues(String, String, Res<Vec<Issue>>),
-    FilterOpts(String, Res<FilterOpts>),
+    FilterOpts(String, Res<(FilterOpts, Refs)>),
+    /// popup id (0 = none), shared reference data
+    Refs(u64, Res<Refs>),
     Prs(String, Res<Vec<Pr>>),
     Detail(String, Res<Box<Detail>>),
     /// popup id, options cache key, result
     Options(u64, String, Res<(Vec<Opt>, TransMap)>),
     Me(Res<(String, String)>),
     Applied { keys: Vec<String>, ok_keys: Vec<String>, edit: Edit, errs: Vec<String> },
+}
+
+/// Reference data shared by the filter panel and the edit popups.
+#[derive(Default)]
+pub struct Refs {
+    priorities: Option<Vec<(String, String)>>,
+    /// project -> assignable users
+    users: Vec<(String, Vec<(String, String)>)>,
+    me: Option<(String, String)>,
+}
+
+/// What a background reference-data fetch should load.
+#[derive(Clone, Default)]
+struct RefNeeds {
+    priorities: bool,
+    users: Vec<String>,
+    me: bool,
+}
+
+impl RefNeeds {
+    fn any(&self) -> bool {
+        self.priorities || self.me || !self.users.is_empty()
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -128,6 +153,17 @@ pub struct Popup {
 }
 
 impl Popup {
+    /// Replace the choices, keeping the highlighted one.
+    fn set_opts(&mut self, opts: Vec<Opt>, trans: TransMap) {
+        let sel = self.state.selected().and_then(|i| self.visible().get(i).map(|o| o.label.clone()));
+        self.opts = opts;
+        self.trans = trans;
+        self.error = if self.opts.is_empty() { Some("No options available".into()) } else { None };
+        let vis = self.visible();
+        let idx = sel.and_then(|l| vis.iter().position(|o| o.label == l)).or(Some(0));
+        self.state.select(if vis.is_empty() { None } else { idx });
+    }
+
     pub fn visible(&self) -> Vec<&Opt> {
         let f = self.filter.to_lowercase();
         self.opts.iter().filter(|o| o.label.to_lowercase().contains(&f)).collect()
@@ -147,6 +183,8 @@ pub struct App {
     filter_opts_loading: HashSet<String>,
     pub fpanel: Option<FilterPanel>,
     filter_opts_fresh: HashSet<String>,
+    /// reference data refreshed (or being refreshed) this session: "priority", "users:KEY"
+    refs_fresh: HashSet<String>,
     dirty: bool,
     last_save: Instant,
     pub cache: Cache,
@@ -202,6 +240,7 @@ impl App {
             filter_opts_loading: HashSet::new(),
             fpanel: None,
             filter_opts_fresh: HashSet::new(),
+            refs_fresh: HashSet::new(),
             dirty: false,
             last_save: Instant::now(),
             cache: Cache::default(),
@@ -259,6 +298,9 @@ impl App {
         }
         self.prs = self.cache.prs.clone();
         self.filter_opts = self.cache.filter_opts.clone();
+        // priorities and users now live in the shared store
+        self.cache.options.retain(|k, _| k.starts_with("status:"));
+        self.sync_refs();
         self.details = self.cache.details.clone();
         if self.cache.me.is_none() {
             self.spawn(|c| Msg::Me(c.myself().map_err(|e| e.to_string())));
@@ -402,10 +444,91 @@ impl App {
         if self.filter_opts_fresh.contains(&project) || !self.filter_opts_loading.insert(project.clone()) {
             return;
         }
+        let users = if project == MY_WORK { vec![] } else { vec![project.clone()] };
+        let needs = self.ref_needs(true, &users);
         self.spawn(move |c| {
-            let r = load_filter_opts(&c, &project).map_err(|e| e.to_string());
+            let r = load_filter_opts(&c, &project, &needs).map_err(|e| e.to_string());
             Msg::FilterOpts(project, r)
         });
+    }
+
+    /// Reference data not yet refreshed this session; marks it as being refreshed.
+    fn ref_needs(&mut self, priorities: bool, projects: &[String]) -> RefNeeds {
+        RefNeeds {
+            priorities: priorities && self.refs_fresh.insert("priority".into()),
+            users: projects.iter().filter(|p| self.refs_fresh.insert(format!("users:{p}"))).cloned().collect(),
+            me: !projects.is_empty() && self.cache.me.is_none(),
+        }
+    }
+
+    fn merge_refs(&mut self, r: Refs) {
+        if let Some(p) = r.priorities {
+            self.cache.priorities = p;
+        }
+        for (k, u) in r.users {
+            self.cache.users.insert(k, u);
+        }
+        if r.me.is_some() {
+            self.cache.me = r.me;
+        }
+        self.dirty = true;
+        self.sync_refs();
+        self.refresh_popup();
+    }
+
+    /// Refill an open Priority/Assignee popup from the shared store.
+    fn refresh_popup(&mut self) {
+        let Some(p) = self.popup.as_ref() else { return };
+        if let Some(opts) = self.ref_opts(p.kind, &p.targets) {
+            let p = self.popup.as_mut().unwrap();
+            p.loading = false;
+            p.set_opts(opts, TransMap::new());
+        }
+    }
+
+    /// Rebuild the filter panel's Priority/Assignee groups from the shared store.
+    fn sync_refs(&mut self) {
+        let me = self.cache.me.as_ref().map(|(id, _)| id.clone());
+        for (view, o) in self.filter_opts.iter_mut() {
+            if !self.cache.priorities.is_empty() {
+                let v = self.cache.priorities.iter().map(|(_, n)| Choice::new(n.clone(), n.clone())).collect();
+                o.groups.insert(Group::Priority, v);
+            }
+            if let Some(users) = self.cache.users.get(view).filter(|_| view != MY_WORK) {
+                let mut people = vec![Choice::new(filter::ME, "Me"), Choice::new(filter::NOBODY, "Unassigned")];
+                people.extend(
+                    users
+                        .iter()
+                        .filter(|(id, _)| Some(id) != me.as_ref())
+                        .map(|(id, name)| Choice::new(id.clone(), name.clone())),
+                );
+                o.groups.insert(Group::Assignee, people);
+            }
+        }
+    }
+
+    /// Edit-popup choices built from the shared store; None if something is missing.
+    fn ref_opts(&self, kind: PopKind, targets: &[String]) -> Option<Vec<Opt>> {
+        match kind {
+            PopKind::Priority => {
+                let p = &self.cache.priorities;
+                (!p.is_empty()).then(|| p.iter().map(|(id, n)| Opt::new(n.clone(), id.clone())).collect())
+            }
+            PopKind::Assignee => {
+                let (me_id, me_name) = self.cache.me.as_ref()?;
+                let lists = projects_of(targets).iter().map(|p| self.cache.users.get(p)).collect::<Option<Vec<_>>>()?;
+                let mut v = vec![Opt::new(format!("Me ({me_name})"), me_id.clone()), Opt::new("Unassigned", "")];
+                // only users assignable in every target project
+                v.extend(
+                    lists[0]
+                        .iter()
+                        .filter(|(id, _)| id != me_id && lists[1..].iter().all(|l| l.iter().any(|(i, _)| i == id)))
+                        .map(|(id, name)| Opt::new(name.clone(), id.clone())),
+                );
+                Some(v)
+            }
+            _ => None,
+        }
     }
 
     fn fetch_detail(&mut self, key: String) {
@@ -578,13 +701,31 @@ impl App {
             Msg::FilterOpts(k, r) => {
                 self.filter_opts_loading.remove(&k);
                 match r {
-                    Ok(o) => {
+                    Ok((o, refs)) => {
                         self.cache.filter_opts.insert(k.clone(), o.clone());
                         self.filter_opts_fresh.insert(k.clone());
                         self.filter_opts.insert(k, o);
-                        self.dirty = true;
+                        self.merge_refs(refs);
                     }
-                    Err(e) => self.status = format!("Error (filters): {e}"),
+                    Err(e) => {
+                        self.refs_fresh.clear();
+                        self.status = format!("Error (filters): {e}");
+                    }
+                }
+            }
+            Msg::Refs(id, r) => {
+                match r {
+                    Ok(refs) => self.merge_refs(refs),
+                    Err(e) => {
+                        self.refs_fresh.clear();
+                        match self.popup.as_mut().filter(|p| p.id == id) {
+                            Some(p) if p.loading => {
+                                p.loading = false;
+                                p.error = Some(e);
+                            }
+                            _ => self.status = format!("Error: couldn't refresh options: {e}"),
+                        }
+                    }
                 }
             }
             Msg::Detail(k, r) => {
@@ -607,19 +748,7 @@ impl App {
                     let had_cached = !p.loading;
                     p.loading = false;
                     match r {
-                        Ok((opts, trans)) => {
-                            // keep the highlighted choice when fresh options replace cached ones
-                            let sel = p.state.selected().and_then(|i| p.visible().get(i).map(|o| o.label.clone()));
-                            p.opts = opts;
-                            p.trans = trans;
-                            p.error = None;
-                            let vis = p.visible();
-                            let idx = sel.and_then(|l| vis.iter().position(|o| o.label == l)).or(Some(0));
-                            p.state.select(if vis.is_empty() { None } else { idx });
-                            if p.opts.is_empty() {
-                                p.error = Some("No options available".into());
-                            }
-                        }
+                        Ok((opts, trans)) => p.set_opts(opts, trans),
                         Err(e) if had_cached => self.status = format!("Error: couldn't refresh options: {e}"),
                         Err(e) => p.error = Some(e),
                     }
@@ -904,7 +1033,34 @@ impl App {
         }
         self.popup_seq += 1;
         let id = self.popup_seq;
-        let key = self.options_key(kind, &targets);
+        if matches!(kind, PopKind::Priority | PopKind::Assignee) {
+            let opts = self.ref_opts(kind, &targets);
+            let needs = match kind {
+                PopKind::Priority => self.ref_needs(true, &[]),
+                _ => self.ref_needs(false, &projects_of(&targets)),
+            };
+            let mut state = ListState::default();
+            if opts.as_ref().is_some_and(|o| !o.is_empty()) {
+                state.select(Some(0));
+            }
+            self.popup = Some(Popup {
+                id,
+                kind,
+                targets,
+                loading: opts.is_none(),
+                error: None,
+                opts: opts.unwrap_or_default(),
+                trans: TransMap::new(),
+                filter: String::new(),
+                state,
+            });
+            // anything already in flight fills the popup via refresh_popup when it lands
+            if needs.any() {
+                self.spawn(move |c| Msg::Refs(id, load_refs(&c, &needs).map_err(|e| e.to_string())));
+            }
+            return;
+        }
+        let key = self.options_key(&targets);
         let cached = self.cache.options.get(&key).cloned();
         let mut state = ListState::default();
         if cached.as_ref().is_some_and(|(o, _)| !o.is_empty()) {
@@ -926,21 +1082,14 @@ impl App {
         self.spawn(move |c| Msg::Options(id, key, load_options(&c, kind, &targets).map_err(|e| e.to_string())));
     }
 
-    /// Cache key for edit-popup choices. Transitions depend on each issue's current status.
-    fn options_key(&self, kind: PopKind, targets: &[String]) -> String {
-        match kind {
-            PopKind::Priority => "priority".into(),
-            PopKind::Assignee => format!("assignee:{}", projects_of(targets).join(",")),
-            PopKind::Status => {
-                let status = |k: &String| {
-                    self.issues.values().flatten().find(|i| &i.key == k).map(|i| i.status.clone()).unwrap_or_default()
-                };
-                let mut parts: Vec<String> = targets.iter().map(|k| format!("{k}@{}", status(k))).collect();
-                parts.sort();
-                format!("status:{}", parts.join(","))
-            }
-            PopKind::Sort => String::new(),
-        }
+    /// Cache key for status transitions, which depend on each issue's current status.
+    fn options_key(&self, targets: &[String]) -> String {
+        let status = |k: &String| {
+            self.issues.values().flatten().find(|i| &i.key == k).map(|i| i.status.clone()).unwrap_or_default()
+        };
+        let mut parts: Vec<String> = targets.iter().map(|k| format!("{k}@{}", status(k))).collect();
+        parts.sort();
+        format!("status:{}", parts.join(","))
     }
 
     fn popup_key(&mut self, k: KeyEvent) {
@@ -1278,51 +1427,34 @@ fn load_options(c: &Client, kind: PopKind, targets: &[String]) -> anyhow::Result
                 .map(|(value, label, to)| Opt { label, value, extra: to })
                 .collect()
         }
-        PopKind::Assignee => {
-            let (me_id, me_name) = c.myself()?;
-            let mut v = vec![
-                Opt::new(format!("Me ({me_name})"), me_id.clone()),
-                Opt::new("Unassigned", ""),
-            ];
-            v.extend(
-                c.assignable_multi(&projects_of(targets))?
-                    .into_iter()
-                    .filter(|(id, _)| *id != me_id)
-                    .map(|(id, name)| Opt::new(name, id)),
-            );
-            v
-        }
-        PopKind::Sort => vec![],
-        PopKind::Priority => c
-            .priorities()?
-            .into_iter()
-            .map(|(id, name)| Opt::new(name, id))
-            .collect(),
+        _ => vec![],
     };
     Ok((opts, trans))
 }
 
-fn load_filter_opts(c: &Client, project: &str) -> anyhow::Result<FilterOpts> {
+fn load_filter_opts(c: &Client, project: &str, needs: &RefNeeds) -> anyhow::Result<(FilterOpts, Refs)> {
     let plain = |v: Vec<String>| v.into_iter().map(|n| Choice::new(n.clone(), n)).collect::<Vec<_>>();
     let mut o = FilterOpts::default();
     let my_work = project == MY_WORK;
     let statuses = if my_work { c.all_statuses()? } else { c.statuses(project)? };
     o.done = statuses.iter().filter(|(_, done)| *done).map(|(n, _)| n.clone()).collect();
     o.groups.insert(Group::Status, plain(statuses.into_iter().map(|(n, _)| n).collect()));
-    if !my_work {
-        let (me_id, _) = c.myself()?;
-        let mut people = vec![Choice::new(filter::ME, "Me"), Choice::new(filter::NOBODY, "Unassigned")];
-        people.extend(
-            c.assignable(project)?
-                .into_iter()
-                .filter(|(id, _)| *id != me_id)
-                .map(|(id, name)| Choice::new(id, name)),
-        );
-        o.groups.insert(Group::Assignee, people);
-    }
-    o.groups.insert(Group::Priority, plain(c.priorities()?.into_iter().map(|(_, n)| n).collect()));
     o.groups.insert(Group::Type, plain(if my_work { c.all_issue_types()? } else { c.issue_types(project)? }));
-    Ok(o)
+    Ok((o, load_refs(c, needs)?))
+}
+
+fn load_refs(c: &Client, needs: &RefNeeds) -> anyhow::Result<Refs> {
+    let mut r = Refs::default();
+    if needs.priorities {
+        r.priorities = Some(c.priorities()?);
+    }
+    for p in &needs.users {
+        r.users.push((p.clone(), c.assignable(p)?));
+    }
+    if needs.me {
+        r.me = Some(c.myself()?);
+    }
+    Ok(r)
 }
 
 /// Prepend the "My work" pseudo-project.

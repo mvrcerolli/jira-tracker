@@ -39,8 +39,12 @@ pub struct Cache {
     pub filter_opts: HashMap<String, FilterOpts>,
     /// issue key -> detail
     pub details: HashMap<String, Detail>,
-    /// edit popup choices: key -> (options, transitions)
+    /// status popup choices: "status:KEY@status,..." -> (options, transitions)
     pub options: HashMap<String, (Vec<Opt>, TransMap)>,
+    /// shared by filter panel and edit popups: (id, name)
+    pub priorities: Vec<(String, String)>,
+    /// project -> assignable users (accountId, name), shared by filter panel and edit popups
+    pub users: HashMap<String, Vec<(String, String)>>,
     /// (accountId, displayName) of the logged-in Jira user
     pub me: Option<(String, String)>,
 }

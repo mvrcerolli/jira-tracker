@@ -363,20 +363,6 @@ impl Client {
         Ok(out)
     }
 
-    /// (accountId, displayName) of users assignable in all of these projects.
-    pub fn assignable_multi(&self, projects: &[String]) -> Result<Vec<(String, String)>> {
-        let v: Vec<Value> = self.get(
-            "/rest/api/3/user/assignable/multiProjectSearch",
-            &[("projectKeys", projects.join(",")), ("maxResults", "1000".into())],
-        )?;
-        let mut out: Vec<_> = v
-            .iter()
-            .filter(|u| u["active"].as_bool().unwrap_or(true))
-            .map(|u| (s(&u["accountId"]), s(&u["displayName"])))
-            .collect();
-        out.sort_by_key(|(_, n)| n.to_lowercase());
-        Ok(out)
-    }
 
     pub fn assign(&self, key: &str, account_id: Option<&str>) -> Result<()> {
         self.send(
