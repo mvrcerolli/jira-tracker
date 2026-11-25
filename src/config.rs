@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Deserialize, Clone)]
@@ -14,6 +15,50 @@ pub struct Config {
     /// Auto-refresh interval in minutes (0 = off).
     #[serde(default = "default_refresh")]
     pub refresh_minutes: u64,
+    /// GitHub token (optional; falls back to GITHUB_TOKEN, then `gh auth token`).
+    #[serde(default)]
+    pub github_token: Option<String>,
+    /// Jira project key -> GitHub repo(s) "owner/name".
+    #[serde(default)]
+    pub github: HashMap<String, Repos>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+pub enum Repos {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Config {
+    /// Repos mapped to a Jira project (case-insensitive key).
+    pub fn repos_for(&self, project: &str) -> Vec<String> {
+        self.github
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(project))
+            .flat_map(|(_, r)| match r {
+                Repos::One(s) => vec![s.clone()],
+                Repos::Many(v) => v.clone(),
+            })
+            .collect()
+    }
+
+    /// Every mapped repo, deduplicated.
+    pub fn all_repos(&self) -> Vec<String> {
+        let mut out: Vec<String> = vec![];
+        for r in self.github.values() {
+            for s in match r {
+                Repos::One(s) => vec![s.clone()],
+                Repos::Many(v) => v.clone(),
+            } {
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
 }
 
 fn default_refresh() -> u64 {
@@ -25,6 +70,12 @@ email     = "you@example.com"
 api_token = "..."            # or set JIRA_API_TOKEN
 # projects = ["ABC", "XYZ"]  # optional: limit/pin projects
 # refresh_minutes = 5        # auto-refresh interval, 0 = off
+
+# GitHub pull requests per project (optional, read-only)
+# github_token = "..."       # optional; else GITHUB_TOKEN, else `gh auth token`
+# [github]
+# ABC = "my-org/abc-repo"
+# XYZ = ["my-org/xyz-api", "my-org/xyz-web"]
 "#;
 
 pub fn path() -> PathBuf {

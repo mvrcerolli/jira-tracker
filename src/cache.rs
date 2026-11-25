@@ -1,4 +1,5 @@
 //! On-disk cache so jt opens instantly with the last known data.
+use crate::github::Pr;
 use crate::jira::{Issue, Project};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -25,6 +26,8 @@ pub struct Cache {
     pub seen: HashMap<String, String>,
     /// views whose issues have a "seen" baseline (avoids highlighting everything on first load)
     pub baselined: HashSet<String>,
+    /// view -> open pull requests
+    pub prs: HashMap<String, Vec<Pr>>,
 }
 
 pub fn now() -> u64 {

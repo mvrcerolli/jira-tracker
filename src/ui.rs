@@ -1,5 +1,6 @@
 use crate::app::{App, Pane, PopKind, SortCol};
 use crate::filter::{Group, MY_WORK};
+use crate::github::{Checks, Pr, Review, age};
 use crate::jira::{Cat, Detail};
 use ratatui::{
     Frame,
@@ -52,9 +53,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_projects {
         draw_projects(f, app, it.next().unwrap());
     }
-    draw_issues(f, app, it.next().unwrap());
+    let mid = it.next().unwrap();
+    if app.show_prs() {
+        let [top, bottom] = Layout::vertical([Constraint::Fill(3), Constraint::Fill(2)]).areas(mid);
+        draw_issues(f, app, top);
+        draw_prs(f, app, bottom);
+    } else {
+        draw_issues(f, app, mid);
+    }
     if app.show_detail {
-        draw_detail(f, app, it.next().unwrap());
+        let r = it.next().unwrap();
+        if app.focus == Pane::Prs { draw_pr_detail(f, app, r) } else { draw_detail(f, app, r) }
     }
     draw_footer(f, app, footer);
     if app.popup.is_some() {
@@ -346,7 +355,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("/", "filter issues"),
         ("t", "sort by column (again to flip)"),
         ("f", "filters: status, assignee, priority, type, JQL"),
-        ("o", "open issue in browser"),
+        ("o", "open issue / PR in browser"),
+        ("g", "jump between issues and pull requests"),
     ]),
     ("Edit", &[
         ("Space", "mark / unmark issue"),
@@ -497,4 +507,140 @@ fn draw_filter(f: &mut Frame, app: &mut App) {
         .highlight_style(Style::new().bg(if fp.in_opts { Color::DarkGray } else { Color::Reset }))
         .highlight_symbol("▌");
     f.render_stateful_widget(list, list_area, &mut fp.state);
+}
+
+// ---------- GitHub pull requests ----------
+fn review_span(p: &Pr) -> Span<'static> {
+    if p.draft {
+        return Span::styled("draft", Style::new().dark_gray());
+    }
+    match p.review {
+        Review::Required | Review::None => Span::styled("review", Style::new().fg(Color::Yellow)),
+        Review::Approved => Span::styled("approved", Style::new().fg(Color::Green)),
+        Review::Changes => Span::styled("changes", Style::new().fg(Color::Red)),
+    }
+}
+
+fn checks_span(c: Checks) -> Span<'static> {
+    match c {
+        Checks::Pass => Span::styled("✓", Style::new().fg(Color::Green)),
+        Checks::Fail => Span::styled("✗", Style::new().fg(Color::Red)),
+        Checks::Pending => Span::styled("◌", Style::new().fg(Color::Yellow)),
+        Checks::None => Span::styled("·", Style::new().dark_gray()),
+    }
+}
+
+fn draw_prs(f: &mut Frame, app: &mut App, area: Rect) {
+    let key = app.current_project().map(|p| p.key.clone()).unwrap_or_default();
+    let focused = app.focus == Pane::Prs;
+    let cur_issue = app.current_issue_key();
+    let repos = app.repos_for(&key);
+    let multi = repos.len() > 1;
+    let prs = app.visible_prs();
+    let waiting = prs.iter().filter(|p| p.wants_me).count();
+    let label = if key == MY_WORK { "My review / my PRs".to_string() } else { repos.join(", ") };
+    let mut title = format!(" Pull requests ({}) · {label} ", prs.len());
+    if waiting > 0 {
+        title.push_str(&format!("· {waiting} waiting for you "));
+    }
+    if app.prs_loading.contains(&key) {
+        title.push_str("· loading… ");
+    }
+    let rows: Vec<Row> = prs
+        .iter()
+        .map(|p| {
+            let linked = p.issue.is_some() && p.issue == cur_issue;
+            let num = if multi || key == MY_WORK {
+                format!("{}#{}", p.repo.rsplit('/').next().unwrap_or(""), p.number)
+            } else {
+                format!("#{}", p.number)
+            };
+            let row = Row::new(vec![
+                Cell::from(if p.wants_me { Span::styled("●", Style::new().fg(MARK).bold()) } else { Span::raw("") }),
+                Cell::from(num).bold(),
+                Cell::from(p.issue.clone().unwrap_or_else(|| "—".into())).fg(ACCENT),
+                Cell::from(p.title.clone()),
+                Cell::from(p.author.clone()),
+                Cell::from(review_span(p)),
+                Cell::from(checks_span(p.checks)),
+                Cell::from(age(&p.created_at)).dark_gray(),
+            ]);
+            if linked { row.bold().bg(Color::Rgb(30, 45, 60)) } else { row }
+        })
+        .collect();
+    let num_w = if multi || key == MY_WORK {
+        prs.iter().map(|p| p.repo.rsplit('/').next().unwrap_or("").len() + 1 + p.number.to_string().len()).max().unwrap_or(6).min(26) as u16
+    } else {
+        6
+    };
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(1),
+            Constraint::Length(num_w),
+            Constraint::Length(9),
+            Constraint::Min(15),
+            Constraint::Length(12),
+            Constraint::Length(8),
+            Constraint::Length(1),
+            Constraint::Length(4),
+        ],
+    )
+    .header(Row::new(["", "#", "Issue", "Title", "Author", "Review", "CI", "Age"]).style(Style::new().fg(ACCENT).bold()))
+    .block(block(title.clone(), focused))
+    .row_highlight_style(Style::new().bg(if focused { Color::DarkGray } else { Color::Reset }))
+    .highlight_symbol(if focused { "▌" } else { " " })
+    .column_spacing(1);
+    if let Some(e) = app.pr_errors.get(&key).cloned()
+        && prs.is_empty()
+    {
+        let p = Paragraph::new(Line::from(format!("GitHub: {e}").red())).wrap(Wrap { trim: true }).block(block(title, focused));
+        f.render_widget(p, area);
+        return;
+    }
+    f.render_stateful_widget(table, area, &mut app.pr_state);
+}
+
+fn draw_pr_detail(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(p) = app.pr_state.selected().and_then(|i| app.visible_prs().get(i)).cloned() else {
+        f.render_widget(Paragraph::new("No pull request selected".dark_gray()).block(block(" Pull request ".into(), false)), area);
+        return;
+    };
+    let mut l = vec![
+        Line::from(vec![
+            Span::styled(format!("{}#{}", p.repo, p.number), Style::new().bold().fg(ACCENT)),
+            Span::raw("  "),
+            review_span(&p),
+        ]),
+        Line::from(Span::styled(p.title.clone(), Style::new().bold())),
+        Line::raw(""),
+        kv("Author", p.author.clone(), None),
+        kv("Branch", p.branch.clone(), None),
+        kv("Issue", p.issue.clone().unwrap_or_else(|| "—".into()), Some(ACCENT)),
+        Line::from(vec![Span::styled(format!("{:<9}", "CI"), Style::new().dark_gray()), checks_span(p.checks)]),
+        Line::from(vec![
+            Span::styled(format!("{:<9}", "Changes"), Style::new().dark_gray()),
+            Span::styled(format!("+{}", p.additions), Style::new().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled(format!("-{}", p.deletions), Style::new().fg(Color::Red)),
+            Span::raw(format!(" in {} files", p.files)),
+        ]),
+        kv("Opened", format!("{} ago", age(&p.created_at)), None),
+    ];
+    if p.wants_me {
+        l.push(Line::from(Span::styled("● Your review is requested", Style::new().fg(MARK).bold())));
+    }
+    l.push(Line::raw(""));
+    l.push(section("Description"));
+    if p.body.trim().is_empty() {
+        l.push(Line::from("No description".dark_gray().italic()));
+    } else {
+        l.extend(p.body.lines().map(|s| Line::raw(s.to_string())));
+    }
+    let max = l.len().saturating_sub(1) as u16;
+    app.detail_scroll = app.detail_scroll.min(max);
+    f.render_widget(
+        Paragraph::new(l).wrap(Wrap { trim: false }).scroll((app.detail_scroll, 0)).block(block(" Pull request ".into(), true)),
+        area,
+    );
 }

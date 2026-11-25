@@ -13,6 +13,12 @@ A fast terminal UI for Jira Cloud: projects on the left, issues on the right, no
    api_token = "..."            # or set JIRA_API_TOKEN
    # projects = ["ABC", "XYZ"]  # optional: only show these projects
    # refresh_minutes = 5        # auto-refresh interval, 0 = off
+
+   # optional: GitHub pull requests per project (read-only)
+   # github_token = "..."       # else GITHUB_TOKEN, else `gh auth token`
+   # [github]
+   # ABC = "my-org/abc-repo"
+   # XYZ = ["my-org/xyz-api", "my-org/xyz-web"]
    ```
 
 3. Install and run:
@@ -34,7 +40,8 @@ Press `?` inside jt for the full list.
 | `*` | pin / unpin project |
 | `Enter` | show / hide issue detail |
 | `J`/`K` | scroll detail |
-| `o` | open issue in browser |
+| `o` | open issue / PR in browser |
+| `g` | jump between issues and pull requests |
 | `/` | text filter |
 | `f` | filters (status, assignee, priority, type, JQL), saved per project |
 | `t` | sort by column |

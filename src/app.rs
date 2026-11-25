@@ -1,5 +1,6 @@
 use crate::cache::{self, Cache};
 use crate::filter::{self, Choice, Filter, FilterOpts, FilterPanel, Group, MY_WORK};
+use crate::github::{GitHub, Pr};
 use crate::jira::{Client, Detail, Issue, Project};
 use std::collections::BTreeMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -18,6 +19,7 @@ pub enum Msg {
     /// project, jql used, result
     Issues(String, String, Res<Vec<Issue>>),
     FilterOpts(String, Res<FilterOpts>),
+    Prs(String, Res<Vec<Pr>>),
     Detail(String, Res<Box<Detail>>),
     Options(u64, Res<(Vec<Opt>, TransMap)>),
     Applied { keys: Vec<String>, ok: usize, errs: Vec<String> },
@@ -27,6 +29,7 @@ pub enum Msg {
 pub enum Pane {
     Projects,
     Issues,
+    Prs,
     Detail,
 }
 
@@ -124,6 +127,12 @@ pub struct App {
     filter_opts_loading: HashSet<String>,
     pub fpanel: Option<FilterPanel>,
     pub cache: Cache,
+    gh: GitHub,
+    pub prs: HashMap<String, Vec<Pr>>,
+    pub pr_errors: HashMap<String, String>,
+    pub prs_loading: HashSet<String>,
+    prs_fresh: HashSet<String>,
+    pub pr_state: TableState,
     /// views fetched from Jira during this session (others show cached data)
     pub fresh: HashSet<String>,
     /// view -> unix time its data was fetched
@@ -157,6 +166,7 @@ pub struct App {
 
 impl App {
     pub fn new(client: Client, tx: Sender<Msg>) -> Self {
+        let gh_token = client.config().github_token.clone();
         let mut app = Self {
             client,
             tx,
@@ -169,6 +179,12 @@ impl App {
             filter_opts_loading: HashSet::new(),
             fpanel: None,
             cache: Cache::default(),
+            gh: GitHub::new(gh_token).expect("http client"),
+            prs: HashMap::new(),
+            pr_errors: HashMap::new(),
+            prs_loading: HashSet::new(),
+            prs_fresh: HashSet::new(),
+            pr_state: TableState::default(),
             fresh: HashSet::new(),
             fetched_at: HashMap::new(),
             last_refresh: Instant::now(),
@@ -216,6 +232,7 @@ impl App {
                 self.issues.insert(view, l.issues);
             }
         }
+        self.prs = self.cache.prs.clone();
         self.clamp_issue();
     }
 
@@ -255,8 +272,12 @@ impl App {
         {
             views.push(k);
         }
+        let pr_views: Vec<String> = self.prs_fresh.iter().cloned().chain(views.iter().cloned()).collect();
         for v in views {
             self.fetch_issues(v);
+        }
+        for v in pr_views {
+            self.fetch_prs(v);
         }
         self.last_refresh = Instant::now();
     }
@@ -364,10 +385,56 @@ impl App {
     }
 
     fn ensure_issues(&mut self) {
-        if let Some(k) = self.current_project().map(|p| p.key.clone())
-            && !self.fresh.contains(&k)
-        {
-            self.fetch_issues(k);
+        if let Some(k) = self.current_project().map(|p| p.key.clone()) {
+            if !self.fresh.contains(&k) {
+                self.fetch_issues(k.clone());
+            }
+            if !self.prs_fresh.contains(&k) {
+                self.fetch_prs(k);
+            }
+        }
+    }
+
+    // ---------- GitHub ----------
+    pub fn repos_for(&self, view: &str) -> Vec<String> {
+        let cfg = self.client.config();
+        if view == MY_WORK { cfg.all_repos() } else { cfg.repos_for(view) }
+    }
+
+    /// Whether the current view has a PR pane.
+    pub fn show_prs(&self) -> bool {
+        self.current_project().is_some_and(|p| !self.repos_for(&p.key).is_empty())
+    }
+
+    pub fn visible_prs(&self) -> &[Pr] {
+        self.current_project().and_then(|p| self.prs.get(&p.key)).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    fn fetch_prs(&mut self, view: String) {
+        let repos = self.repos_for(&view);
+        if repos.is_empty() || !self.prs_loading.insert(view.clone()) {
+            return;
+        }
+        let known: Vec<String> = self.projects.iter().map(|p| p.key.clone()).filter(|k| k != MY_WORK).collect();
+        let (gh, tx) = (self.gh.clone(), self.tx.clone());
+        thread::spawn(move || {
+            let r = gh.prs(&repos, &known).map_err(|e| e.to_string()).map(|mut v| {
+                if view == MY_WORK {
+                    v.retain(|p| p.wants_me || p.mine);
+                }
+                v.sort_by_key(|p| !p.wants_me); // stable: keeps newest-first within groups
+                v
+            });
+            let _ = tx.send(Msg::Prs(view, r));
+        });
+    }
+
+    fn open_pr(&mut self) {
+        if let Some(p) = self.pr_state.selected().and_then(|i| self.visible_prs().get(i)).cloned() {
+            self.status = match open::that_detached(&p.url) {
+                Ok(_) => format!("Opened #{}", p.number),
+                Err(e) => format!("Error: couldn't open browser: {e}"),
+            };
         }
     }
 
@@ -452,6 +519,24 @@ impl App {
                     Err(e) => self.status = format!("Error ({k}): {e}"),
                 }
             }
+            Msg::Prs(k, r) => {
+                self.prs_loading.remove(&k);
+                self.prs_fresh.insert(k.clone());
+                match r {
+                    Ok(v) => {
+                        self.pr_errors.remove(&k);
+                        self.cache.prs.insert(k.clone(), v.clone());
+                        self.prs.insert(k, v);
+                        let n = self.visible_prs().len();
+                        let sel = self.pr_state.selected().map(|i| i.min(n.saturating_sub(1)));
+                        self.pr_state.select(if n == 0 { None } else { sel.or(Some(0)) });
+                        self.save_cache();
+                    }
+                    Err(e) => {
+                        self.pr_errors.insert(k, e);
+                    }
+                }
+            }
             Msg::FilterOpts(k, r) => {
                 self.filter_opts_loading.remove(&k);
                 match r {
@@ -526,6 +611,7 @@ impl App {
                 if Some(new) != self.proj_state.selected() {
                     self.proj_state.select(Some(new));
                     self.issue_state.select(None);
+                    self.pr_state.select(Some(0));
                     self.filter.clear();
                     self.marked.clear();
                     self.ensure_issues();
@@ -539,6 +625,14 @@ impl App {
                 }
                 let i = self.issue_state.selected().unwrap_or(0) as isize;
                 self.issue_state.select(Some((i + delta).clamp(0, n as isize - 1) as usize));
+            }
+            Pane::Prs => {
+                let n = self.visible_prs().len();
+                if n == 0 {
+                    return;
+                }
+                let i = self.pr_state.selected().unwrap_or(0) as isize;
+                self.pr_state.select(Some((i + delta).clamp(0, n as isize - 1) as usize));
             }
             Pane::Detail => self.scroll_detail(delta),
         }
@@ -823,6 +917,9 @@ impl App {
                     panes.push(Pane::Projects);
                 }
                 panes.push(Pane::Issues);
+                if self.show_prs() {
+                    panes.push(Pane::Prs);
+                }
                 if self.show_detail {
                     panes.push(Pane::Detail);
                 }
@@ -835,7 +932,7 @@ impl App {
                 self.focus = match self.focus {
                     Pane::Detail => Pane::Issues,
                     _ if self.show_projects => Pane::Projects,
-                    f => f,
+                    _ => Pane::Issues,
                 }
             }
             KeyCode::Char('l') | KeyCode::Right => {
@@ -844,6 +941,12 @@ impl App {
                     _ if self.show_detail => Pane::Detail,
                     f => f,
                 }
+            }
+            KeyCode::Char('g') => {
+                self.focus = if self.focus == Pane::Prs || !self.show_prs() { Pane::Issues } else { Pane::Prs };
+            }
+            KeyCode::Char(' ' | 's' | 'a' | 'p') if self.focus == Pane::Prs => {
+                self.status = "Pull requests are read-only here (o opens in browser)".into();
             }
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('*') => self.toggle_pin(),
@@ -906,6 +1009,7 @@ impl App {
                 Pane::Projects => self.focus = Pane::Issues,
                 _ => self.toggle_detail(),
             },
+            KeyCode::Char('o') if self.focus == Pane::Prs => self.open_pr(),
             KeyCode::Char('o') => self.open_selected(),
             _ => {}
         }

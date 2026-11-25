@@ -121,6 +121,10 @@ impl Client {
         Ok(Self { http, cfg })
     }
 
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
     pub fn base_url(&self) -> &str {
         &self.cfg.base_url
     }

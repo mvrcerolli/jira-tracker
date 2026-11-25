@@ -2,6 +2,7 @@ mod app;
 mod cache;
 mod config;
 mod filter;
+mod github;
 mod jira;
 mod ui;
 
