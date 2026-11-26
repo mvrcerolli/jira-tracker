@@ -5,6 +5,7 @@ mod filter;
 mod github;
 mod jira;
 mod ui;
+mod view;
 
 use crossterm::event::{self, Event, KeyEventKind};
 use std::{sync::mpsc, time::Duration};

@@ -1,4 +1,5 @@
-use crate::app::{App, Pane, PopKind, SortCol};
+use crate::app::{App, Pane, PopKind};
+use crate::view::{Col, EditKind};
 use crate::filter::{Group, MY_WORK};
 use crate::github::{Checks, Pr, Review, age};
 use crate::jira::{Cat, Detail};
@@ -72,6 +73,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.fpanel.is_some() {
         draw_filter(f, app);
     }
+    if app.order_edit.is_some() {
+        draw_order_edit(f, app);
+    }
     if app.show_help {
         draw_help(f);
     }
@@ -131,6 +135,7 @@ fn draw_issues(f: &mut Frame, app: &mut App, area: Rect) {
     let baselined = app.current_project().is_some_and(|p| app.cache.baselined.contains(&p.key));
     let issues = app.visible_issues();
     let show_pr = app.has_prs();
+    let cols: Vec<Col> = app.view.cols().into_iter().filter(|c| *c != Col::Pr || show_pr).collect();
     let by_issue = app.prs_by_issue();
     let pr_cell = |key: &str| -> Cell<'static> {
         let Some(ps) = by_issue.get(key) else { return Cell::from("") };
@@ -151,20 +156,20 @@ fn draw_issues(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 (" ", MARK)
             };
-            let key_cell = Cell::from(i.key.clone()).bold();
-            let mut cells = vec![
-                Cell::from(sym).fg(sym_color),
-                if changed { key_cell.fg(CHANGED) } else { key_cell },
-            ];
-            if show_pr {
-                cells.push(pr_cell(&i.key));
-            }
-            cells.extend([
-                Cell::from(i.status.clone()).fg(cat_color(&i.cat)),
-                Cell::from(i.priority.clone()).fg(prio_color(&i.priority)),
-                Cell::from(i.assignee.clone()),
-                Cell::from(i.summary.clone()),
-            ]);
+            let mut cells = vec![Cell::from(sym).fg(sym_color)];
+            cells.extend(cols.iter().map(|c| match c {
+                Col::Key => {
+                    let k = Cell::from(i.key.clone()).bold();
+                    if changed { k.fg(CHANGED) } else { k }
+                }
+                Col::Pr => pr_cell(&i.key),
+                Col::Status => Cell::from(i.status.clone()).fg(cat_color(&i.cat)),
+                Col::Priority => Cell::from(i.priority.clone()).fg(prio_color(&i.priority)),
+                Col::Assignee => Cell::from(i.assignee.clone()),
+                Col::Type => Cell::from(i.issuetype.clone()),
+                Col::Labels => label_cell(&app.view.sorted_labels(&i.labels)),
+                Col::Summary => Cell::from(i.summary.clone()),
+            }));
             let row = Row::new(cells);
             if marked { row.fg(MARK) } else { row }
         })
@@ -193,23 +198,23 @@ fn draw_issues(f: &mut Frame, app: &mut App, area: Rect) {
         title.push_str(&format!("· filter: {}{} ", app.filter, if app.filtering { "▏" } else { "" }));
     }
     let arrow = if app.sort_desc { " ▼" } else { " ▲" };
-    let mut header: Vec<String> = std::iter::once(String::new())
-        .chain(SortCol::ALL.iter().map(|c| {
+    let header: Vec<String> = std::iter::once(String::new())
+        .chain(cols.iter().map(|c| {
             if *c == app.sort_col { format!("{}{arrow}", c.name()) } else { c.name().to_string() }
         }))
         .collect();
-    let mut widths = vec![
-        Constraint::Length(1),
-        Constraint::Length(10),
-        Constraint::Length(13),
-        Constraint::Length(8),
-        Constraint::Length(14),
-        Constraint::Min(15),
-    ];
-    if show_pr {
-        header.insert(2, "PR".into());
-        widths.insert(2, Constraint::Length(7));
-    }
+    let widths: Vec<Constraint> = std::iter::once(Constraint::Length(1))
+        .chain(cols.iter().map(|c| match c {
+            Col::Key => Constraint::Length(10),
+            Col::Pr => Constraint::Length(7),
+            Col::Status => Constraint::Length(13),
+            Col::Priority => Constraint::Length(8),
+            Col::Assignee => Constraint::Length(14),
+            Col::Type => Constraint::Length(10),
+            Col::Labels => Constraint::Length(LABEL_W as u16),
+            Col::Summary => Constraint::Min(15),
+        }))
+        .collect();
     let table = Table::new(rows, widths)
     .header(Row::new(header).style(Style::new().fg(ACCENT).bold()))
     .block(block(title, app.focus == Pane::Issues))
@@ -217,6 +222,21 @@ fn draw_issues(f: &mut Frame, app: &mut App, area: Rect) {
     .highlight_symbol("▌")
     .column_spacing(1);
     f.render_stateful_widget(table, area, &mut app.issue_state);
+}
+
+const LABEL_W: usize = 16;
+
+/// Most important label, then "+N" for the rest; the label is cut so "+N" always shows.
+fn label_cell(labels: &[&String]) -> Cell<'static> {
+    let Some(first) = labels.first() else { return Cell::from("") };
+    let more = if labels.len() > 1 { format!(" +{}", labels.len() - 1) } else { String::new() };
+    let room = LABEL_W - more.chars().count();
+    let mut l: String = first.chars().take(room).collect();
+    if first.chars().count() > room {
+        l.pop();
+        l.push('…');
+    }
+    Cell::from(Line::from(vec![Span::styled(l, Style::new().fg(Color::Yellow)), Span::styled(more, Style::new().dark_gray())]))
 }
 
 fn kv(k: &str, v: String, color: Option<Color>) -> Line<'static> {
@@ -294,6 +314,8 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = if app.fpanel.is_some() {
         "↑/↓ move · ←/→ column · Space tick · type to search · Ctrl+x untick all · Ctrl+r reset group · Enter apply · Esc cancel"
+    } else if app.order_edit.is_some() {
+        "j/k move · ←/→, J/K or Shift+↑/↓ reorder · Space show/hide · Enter save · Esc cancel"
     } else if app.popup.is_some() {
         "type to search · ↑/↓ choose · Enter apply · Esc cancel"
     } else if app.filtering {
@@ -313,7 +335,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         };
         Line::from(vec![Span::styled(app.status.clone(), st), Span::raw("  "), hints.dark_gray()])
     };
-    f.render_widget(Paragraph::new(line), area);
+    let ver = concat!("v", env!("CARGO_PKG_VERSION"));
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(ver.len() as u16 + 1)]).areas(area);
+    f.render_widget(Paragraph::new(line), left);
+    f.render_widget(Paragraph::new(Line::from(ver.dark_gray()).right_aligned()), right);
 }
 
 fn draw_popup(f: &mut Frame, app: &mut App) {
@@ -357,6 +383,50 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
     f.render_stateful_widget(list, list_area, &mut p.state);
 }
 
+fn draw_order_edit(f: &mut Frame, app: &mut App) {
+    let Some(e) = app.order_edit.as_mut() else { return };
+    let (title, hint) = match e.kind {
+        EditKind::Columns => (" Columns ", " ✓ shown · top = leftmost "),
+        EditKind::Labels => (" Label priority ", " top = shown first · ✗ never shown "),
+    };
+    let area = f.area();
+    let longest = e.items.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0) as u16;
+    let w = (longest + 12).max(40).min(area.width);
+    let h = (e.items.len() as u16 + 2).clamp(5, 24).min(area.height);
+    let [r] = Layout::horizontal([Constraint::Length(w)]).flex(Flex::Center).areas(area);
+    let [r] = Layout::vertical([Constraint::Length(h)]).flex(Flex::Center).areas(r);
+    f.render_widget(Clear, r);
+    let b = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(title)
+        .title_bottom(Line::from(hint.dark_gray()).right_aligned());
+    let labels = e.kind == EditKind::Labels;
+    let items: Vec<ListItem> = e
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, (n, shown))| {
+            let (mark, st) = match (shown, labels) {
+                (true, _) => ("✓", Style::new().fg(Color::Green)),
+                (false, true) => ("✗", Style::new().fg(Color::Red)),
+                (false, false) => (" ", Style::new()),
+            };
+            let name = if *shown { Style::new() } else { Style::new().dark_gray() };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{:>3} ", i + 1), Style::new().dark_gray()),
+                Span::styled(format!("{mark} "), st),
+                Span::styled(n.clone(), name),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(b)
+        .highlight_style(Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▌");
+    f.render_stateful_widget(list, r, &mut e.state);
+}
+
 type HelpGroup = (&'static str, &'static [(&'static str, &'static str)]);
 
 const HELP_LEFT: &[HelpGroup] = &[
@@ -389,6 +459,10 @@ const HELP_RIGHT: &[HelpGroup] = &[
         ("s", "status"),
         ("a", "assignee"),
         ("p", "priority"),
+    ]),
+    ("View", &[
+        ("C", "columns: order / show"),
+        ("L", "label priority"),
     ]),
     ("Project", &[
         ("*", "pin / unpin"),

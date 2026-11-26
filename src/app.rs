@@ -2,6 +2,7 @@ use crate::cache::{self, Cache};
 use crate::filter::{self, Choice, Filter, FilterOpts, FilterPanel, Group, MY_WORK};
 use crate::github::{GitHub, Pr};
 use crate::jira::{Client, Detail, Issue, Project};
+use crate::view::{self, Col, OrderEdit, View};
 use std::collections::BTreeMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
@@ -66,28 +67,6 @@ pub enum PopKind {
     Assignee,
     Priority,
     Sort,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-pub enum SortCol {
-    Key,
-    Status,
-    Priority,
-    Assignee,
-    Summary,
-}
-
-impl SortCol {
-    pub const ALL: [SortCol; 5] = [SortCol::Key, SortCol::Status, SortCol::Priority, SortCol::Assignee, SortCol::Summary];
-    pub fn name(self) -> &'static str {
-        match self {
-            SortCol::Key => "Key",
-            SortCol::Status => "Status",
-            SortCol::Priority => "Priority",
-            SortCol::Assignee => "Assignee",
-            SortCol::Summary => "Summary",
-        }
-    }
 }
 
 fn key_num(k: &str) -> u64 {
@@ -212,7 +191,9 @@ pub struct App {
     pub show_projects: bool,
     pub show_detail: bool,
     pub show_help: bool,
-    pub sort_col: SortCol,
+    pub sort_col: Col,
+    pub view: View,
+    pub order_edit: Option<OrderEdit>,
     pub sort_desc: bool,
     pub pinned: Vec<String>,
     pub popup: Option<Popup>,
@@ -265,7 +246,9 @@ impl App {
             show_projects: true,
             show_detail: false,
             show_help: false,
-            sort_col: SortCol::Key,
+            sort_col: Col::Key,
+            view: view::load(),
+            order_edit: None,
             sort_desc: true,
             pinned: crate::config::load_pins(),
             popup: None,
@@ -370,19 +353,23 @@ impl App {
             .iter()
             .filter(|i| {
                 f.is_empty()
-                    || [&i.key, &i.summary, &i.status, &i.assignee, &i.priority]
+                    || [&i.key, &i.summary, &i.status, &i.assignee, &i.priority, &i.issuetype]
                         .iter()
                         .any(|s| s.to_lowercase().contains(&f))
+                    || i.labels.iter().any(|l| l.to_lowercase().contains(&f))
             })
             .collect();
         v.sort_by(|a, b| {
             let o = match self.sort_col {
-                SortCol::Key => key_num(&a.key).cmp(&key_num(&b.key)),
-                SortCol::Status => (cat_rank(&a.cat), a.status.to_lowercase())
+                Col::Key | Col::Pr => key_num(&a.key).cmp(&key_num(&b.key)),
+                Col::Status => (cat_rank(&a.cat), a.status.to_lowercase())
                     .cmp(&(cat_rank(&b.cat), b.status.to_lowercase())),
-                SortCol::Priority => prio_rank(&a.priority).cmp(&prio_rank(&b.priority)),
-                SortCol::Assignee => a.assignee.to_lowercase().cmp(&b.assignee.to_lowercase()),
-                SortCol::Summary => a.summary.to_lowercase().cmp(&b.summary.to_lowercase()),
+                Col::Priority => prio_rank(&a.priority).cmp(&prio_rank(&b.priority)),
+                Col::Assignee => a.assignee.to_lowercase().cmp(&b.assignee.to_lowercase()),
+                Col::Type => a.issuetype.to_lowercase().cmp(&b.issuetype.to_lowercase()),
+                // most important label first when ascending
+                Col::Labels => self.view.label_key(&a.labels).cmp(&self.view.label_key(&b.labels)),
+                Col::Summary => a.summary.to_lowercase().cmp(&b.summary.to_lowercase()),
             };
             // ties: newest key first
             let o = if self.sort_desc { o.reverse() } else { o };
@@ -998,7 +985,8 @@ impl App {
 
     fn open_sort(&mut self) {
         self.popup_seq += 1;
-        let opts: Vec<Opt> = SortCol::ALL
+        let cols: Vec<Col> = self.view.cols().into_iter().filter(|c| c.sortable()).collect();
+        let opts: Vec<Opt> = cols
             .iter()
             .map(|c| {
                 let label = if *c == self.sort_col {
@@ -1009,7 +997,7 @@ impl App {
                 Opt::new(label, c.name())
             })
             .collect();
-        let cur = SortCol::ALL.iter().position(|c| *c == self.sort_col);
+        let cur = cols.iter().position(|c| *c == self.sort_col).or(Some(0));
         let mut state = ListState::default();
         state.select(cur);
         self.popup = Some(Popup {
@@ -1026,14 +1014,14 @@ impl App {
     }
 
     fn set_sort(&mut self, name: &str) {
-        let Some(col) = SortCol::ALL.into_iter().find(|c| c.name() == name) else { return };
+        let Some(col) = Col::parse(name) else { return };
         let keep = self.current_issue_key();
         if col == self.sort_col {
             self.sort_desc = !self.sort_desc;
         } else {
             self.sort_col = col;
             // sensible defaults: newest key / most important first, text A→Z
-            self.sort_desc = matches!(col, SortCol::Key | SortCol::Priority);
+            self.sort_desc = matches!(col, Col::Key | Col::Priority);
         }
         if let Some(k) = keep {
             let pos = self.visible_issues().iter().position(|i| i.key == k);
@@ -1205,6 +1193,10 @@ impl App {
             self.popup_key(k);
             return;
         }
+        if self.order_edit.is_some() {
+            self.order_key(k);
+            return;
+        }
         if self.fpanel.is_some() {
             self.filter_key(k);
             return;
@@ -1325,6 +1317,17 @@ impl App {
                 }
             }
             KeyCode::Char('t') => self.open_sort(),
+            KeyCode::Char('C') => self.order_edit = Some(OrderEdit::columns(&self.view)),
+            KeyCode::Char('L') => {
+                let mut seen: Vec<String> = self.issues.values().flatten().flat_map(|i| i.labels.clone()).collect();
+                seen.sort_by_key(|l| l.to_lowercase());
+                let e = OrderEdit::labels(&self.view, seen);
+                if e.items.is_empty() {
+                    self.status = "No labels on the loaded issues".into();
+                } else {
+                    self.order_edit = Some(e);
+                }
+            }
             KeyCode::Char('f') => self.open_filter(),
             KeyCode::Char('s') => self.open_popup(PopKind::Status),
             KeyCode::Char('a') => self.open_popup(PopKind::Assignee),
@@ -1358,6 +1361,34 @@ impl App {
             },
             KeyCode::Char('o') if self.focus == Pane::Prs => self.open_pr(),
             KeyCode::Char('o') => self.open_selected(),
+            _ => {}
+        }
+    }
+
+    fn order_key(&mut self, k: KeyEvent) {
+        let Some(e) = self.order_edit.as_mut() else { return };
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.order_edit = None,
+            KeyCode::Char('K') => e.shift(-1),
+            KeyCode::Char('J') => e.shift(1),
+            KeyCode::Up if shift => e.shift(-1),
+            KeyCode::Down if shift => e.shift(1),
+            KeyCode::Left => e.shift(-1),
+            KeyCode::Right => e.shift(1),
+            KeyCode::Char('k') | KeyCode::Up => e.step(-1),
+            KeyCode::Char('j') | KeyCode::Down => e.step(1),
+            KeyCode::Home => e.state.select(Some(0)),
+            KeyCode::End => e.step(isize::MAX / 2),
+            KeyCode::Char(' ') => e.toggle(),
+            KeyCode::Enter => {
+                let e = self.order_edit.take().unwrap();
+                e.apply(&mut self.view);
+                self.status = match view::save(&self.view) {
+                    Ok(()) => "Saved view.toml".into(),
+                    Err(err) => format!("Error saving view: {err}"),
+                };
+            }
             _ => {}
         }
     }

@@ -417,6 +417,7 @@ mod tests {
             updated: String::new(),
             issuetype: ty.into(),
             assignee_id: aid.into(),
+            labels: vec![],
         };
         let todo = issue("To Do", Cat::Todo, "me1", "High", "Bug");
         let done = issue("Done", Cat::Done, "", "Low", "Task");

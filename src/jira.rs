@@ -40,6 +40,8 @@ pub struct Issue {
     /// accountId ("" = unassigned)
     #[serde(default)]
     pub assignee_id: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 // --- raw API shapes ---
@@ -72,6 +74,8 @@ struct RawFields {
     priority: Option<NameOnly>,
     updated: Option<String>,
     issuetype: Option<NameOnly>,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 #[derive(Deserialize)]
 struct NameOnly {
@@ -119,6 +123,7 @@ impl From<RawIssue> for Issue {
             issuetype: f.issuetype.map(|t| t.name).unwrap_or_default(),
             priority: f.priority.map(|p| p.name).unwrap_or_default(),
             updated: f.updated.unwrap_or_default(),
+            labels: f.labels,
         }
     }
 }
@@ -219,7 +224,7 @@ impl Client {
         loop {
             let mut q = vec![
                 ("jql", jql.clone()),
-                ("fields", "summary,status,assignee,priority,updated,issuetype".into()),
+                ("fields", "summary,status,assignee,priority,updated,issuetype,labels".into()),
                 ("maxResults", "100".into()),
             ];
             if let Some(t) = &token {

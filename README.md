@@ -45,6 +45,8 @@ Press `?` inside jt for the full list.
 | `/` | text filter |
 | `f` | filters (status, assignee, priority, type, JQL), saved per project |
 | `t` | sort by column |
+| `C` | columns: reorder (`←`/`→` or `J`/`K`), show / hide (`Space`) |
+| `L` | label priority: reorder, hide labels |
 | `Space`, `Ctrl+a` | mark issue / all |
 | `s` / `a` / `p` | change status / assignee / priority (marked issues or selected) |
 | `z` | show / hide projects (showing focuses them) |
@@ -56,8 +58,9 @@ Press `?` inside jt for the full list.
 - **Cache:** jt opens instantly with the last data (`~/.cache/jt/cache.json`, `%LOCALAPPDATA%\jt\cache.json` on Windows) and refreshes in the background.
 - **Auto-refresh** every `refresh_minutes` (default 5). Issues new or changed since you last looked show `◆`; the sidebar shows `+N` per project. Moving the cursor onto an issue marks it seen.
 - **PR column:** when the project has GitHub repos, each issue shows its open PR (`#123`, `+N` if more), linked by the Jira key in the PR title or branch. Color = review state.
+- **Labels column:** shows the most important label plus `+N` for the rest. Importance is the order you set with `L` (unlisted labels come after, A→Z).
 
-Pins and filters are stored next to the config (`pinned.txt`, `filters.toml`).
+Pins, filters and the column / label layout are stored next to the config (`pinned.txt`, `filters.toml`, `view.toml`).
 
 ## Windows build (from Linux)
 
