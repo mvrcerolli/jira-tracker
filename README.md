@@ -47,7 +47,7 @@ Press `?` inside jt for the full list.
 | `t` | sort by column |
 | `Space`, `Ctrl+a` | mark issue / all |
 | `s` / `a` / `p` | change status / assignee / priority (marked issues or selected) |
-| `z` | show / hide projects |
+| `z` | show / hide projects (showing focuses them) |
 | `c` | mark listed issues as seen (clears `◆`) |
 | `r` / `R` | refresh project + PRs / everything |
 | `Ctrl+c` | quit |
@@ -55,6 +55,7 @@ Press `?` inside jt for the full list.
 - **◎ My work** (top of the sidebar): everything assigned to you across all projects.
 - **Cache:** jt opens instantly with the last data (`~/.cache/jt/cache.json`, `%LOCALAPPDATA%\jt\cache.json` on Windows) and refreshes in the background.
 - **Auto-refresh** every `refresh_minutes` (default 5). Issues new or changed since you last looked show `◆`; the sidebar shows `+N` per project. Moving the cursor onto an issue marks it seen.
+- **PR column:** when the project has GitHub repos, each issue shows its open PR (`#123`, `+N` if more), linked by the Jira key in the PR title or branch. Color = review state.
 
 Pins and filters are stored next to the config (`pinned.txt`, `filters.toml`).
 

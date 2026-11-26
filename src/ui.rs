@@ -130,6 +130,15 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_issues(f: &mut Frame, app: &mut App, area: Rect) {
     let baselined = app.current_project().is_some_and(|p| app.cache.baselined.contains(&p.key));
     let issues = app.visible_issues();
+    let show_pr = app.show_prs();
+    let by_issue = app.prs_by_issue();
+    let pr_cell = |key: &str| -> Cell<'static> {
+        let Some(ps) = by_issue.get(key) else { return Cell::from("") };
+        let p = ps[0];
+        let more = if ps.len() > 1 { format!("+{}", ps.len() - 1) } else { String::new() };
+        let style = review_span(p).style;
+        Cell::from(Line::from(vec![Span::styled(format!("#{}", p.number), style), Span::raw(more)]))
+    };
     let rows: Vec<Row> = issues
         .iter()
         .map(|i| {
@@ -143,14 +152,20 @@ fn draw_issues(f: &mut Frame, app: &mut App, area: Rect) {
                 (" ", MARK)
             };
             let key_cell = Cell::from(i.key.clone()).bold();
-            let row = Row::new(vec![
+            let mut cells = vec![
                 Cell::from(sym).fg(sym_color),
                 if changed { key_cell.fg(CHANGED) } else { key_cell },
+            ];
+            if show_pr {
+                cells.push(pr_cell(&i.key));
+            }
+            cells.extend([
                 Cell::from(i.status.clone()).fg(cat_color(&i.cat)),
                 Cell::from(i.priority.clone()).fg(prio_color(&i.priority)),
                 Cell::from(i.assignee.clone()),
                 Cell::from(i.summary.clone()),
             ]);
+            let row = Row::new(cells);
             if marked { row.fg(MARK) } else { row }
         })
         .collect();
@@ -178,22 +193,24 @@ fn draw_issues(f: &mut Frame, app: &mut App, area: Rect) {
         title.push_str(&format!("· filter: {}{} ", app.filter, if app.filtering { "▏" } else { "" }));
     }
     let arrow = if app.sort_desc { " ▼" } else { " ▲" };
-    let header: Vec<String> = std::iter::once(String::new())
+    let mut header: Vec<String> = std::iter::once(String::new())
         .chain(SortCol::ALL.iter().map(|c| {
             if *c == app.sort_col { format!("{}{arrow}", c.name()) } else { c.name().to_string() }
         }))
         .collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(1),
-            Constraint::Length(10),
-            Constraint::Length(13),
-            Constraint::Length(8),
-            Constraint::Length(14),
-            Constraint::Min(15),
-        ],
-    )
+    let mut widths = vec![
+        Constraint::Length(1),
+        Constraint::Length(10),
+        Constraint::Length(13),
+        Constraint::Length(8),
+        Constraint::Length(14),
+        Constraint::Min(15),
+    ];
+    if show_pr {
+        header.insert(2, "PR".into());
+        widths.insert(2, Constraint::Length(7));
+    }
+    let table = Table::new(rows, widths)
     .header(Row::new(header).style(Style::new().fg(ACCENT).bold()))
     .block(block(title, app.focus == Pane::Issues))
     .row_highlight_style(Style::new().bg(Color::DarkGray))

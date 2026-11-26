@@ -586,6 +586,20 @@ impl App {
         });
     }
 
+    /// Open PRs linked to each Jira issue (by key in the PR title or branch), from every cached view.
+    pub fn prs_by_issue(&self) -> HashMap<&str, Vec<&Pr>> {
+        let mut m: HashMap<&str, Vec<&Pr>> = HashMap::new();
+        let mut seen = HashSet::new();
+        for p in self.prs.values().flatten() {
+            if let Some(k) = &p.issue
+                && seen.insert(p.url.as_str())
+            {
+                m.entry(k.as_str()).or_default().push(p);
+            }
+        }
+        m
+    }
+
     fn open_pr(&mut self) {
         if let Some(p) = self.pr_state.selected().and_then(|i| self.visible_prs().get(i)).cloned() {
             self.status = match open::that_detached(&p.url) {
@@ -1265,7 +1279,9 @@ impl App {
             KeyCode::Char(c @ '1'..='9') => self.jump_pinned(c as usize - '1' as usize),
             KeyCode::Char('z') => {
                 self.show_projects = !self.show_projects;
-                if !self.show_projects && self.focus == Pane::Projects {
+                if self.show_projects {
+                    self.focus = Pane::Projects;
+                } else if self.focus == Pane::Projects {
                     self.focus = Pane::Issues;
                 }
             }
