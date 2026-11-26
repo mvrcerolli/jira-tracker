@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 type Res<T> = Result<T, String>;
-/// issue key -> (transition name -> transition id)
+/// issue key -> (target status -> transition id)
 pub type TransMap = HashMap<String, HashMap<String, String>>;
 
 pub enum Msg {
@@ -299,7 +299,7 @@ impl App {
         self.prs = self.cache.prs.clone();
         self.filter_opts = self.cache.filter_opts.clone();
         // priorities and users now live in the shared store
-        self.cache.options.retain(|k, _| k.starts_with("status:"));
+        self.cache.options.retain(|k, _| k.starts_with("status2:"));
         self.sync_refs();
         self.details = self.cache.details.clone();
         if self.cache.me.is_none() {
@@ -1111,7 +1111,7 @@ impl App {
         };
         let mut parts: Vec<String> = targets.iter().map(|k| format!("{k}@{}", status(k))).collect();
         parts.sort();
-        format!("status:{}", parts.join(","))
+        format!("status2:{}", parts.join(","))
     }
 
     fn popup_key(&mut self, k: KeyEvent) {
@@ -1439,28 +1439,24 @@ fn load_options(c: &Client, kind: PopKind, targets: &[String]) -> anyhow::Result
     let mut trans = TransMap::new();
     let opts = match kind {
         PopKind::Status => {
-            // Only offer transitions available for every target issue.
-            let mut common: Option<Vec<(String, String, String)>> = None; // (name, label, to)
+            // Offer target statuses (same names as the filter panel) reachable from every target issue.
+            let mut common: Option<Vec<String>> = None;
             for key in targets {
-                let ts = c.transitions(key)?;
-                let names: HashSet<&String> = ts.iter().map(|t| &t.1).collect();
+                let mut by_status: HashMap<String, String> = HashMap::new(); // target status -> transition id
+                let mut order = vec![];
+                for (id, _, to) in c.transitions(key)? {
+                    if let std::collections::hash_map::Entry::Vacant(e) = by_status.entry(to.clone()) {
+                        e.insert(id);
+                        order.push(to);
+                    }
+                }
                 common = Some(match common {
-                    None => ts
-                        .iter()
-                        .map(|(_, name, to)| {
-                            let label = if name == to { name.clone() } else { format!("{name}  → {to}") };
-                            (name.clone(), label, to.clone())
-                        })
-                        .collect(),
-                    Some(prev) => prev.into_iter().filter(|(n, _, _)| names.contains(n)).collect(),
+                    None => order,
+                    Some(prev) => prev.into_iter().filter(|s| by_status.contains_key(s)).collect(),
                 });
-                trans.insert(key.clone(), ts.into_iter().map(|(id, name, _)| (name, id)).collect());
+                trans.insert(key.clone(), by_status);
             }
-            common
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(value, label, to)| Opt { label, value, extra: to })
-                .collect()
+            common.unwrap_or_default().into_iter().map(|to| Opt { label: to.clone(), value: to.clone(), extra: to }).collect()
         }
         _ => vec![],
     };

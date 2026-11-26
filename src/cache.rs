@@ -39,7 +39,7 @@ pub struct Cache {
     pub filter_opts: HashMap<String, FilterOpts>,
     /// issue key -> detail
     pub details: HashMap<String, Detail>,
-    /// status popup choices: "status:KEY@status,..." -> (options, transitions)
+    /// status popup choices: "status2:KEY@status,..." -> (options, transitions)
     pub options: HashMap<String, (Vec<Opt>, TransMap)>,
     /// shared by filter panel and edit popups: (id, name)
     pub priorities: Vec<(String, String)>,
