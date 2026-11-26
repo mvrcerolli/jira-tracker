@@ -357,68 +357,123 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
     f.render_stateful_widget(list, list_area, &mut p.state);
 }
 
-const HELP: &[(&str, &[(&str, &str)])] = &[
-    ("Move", &[
+type HelpGroup = (&'static str, &'static [(&'static str, &'static str)]);
+
+const HELP_LEFT: &[HelpGroup] = &[
+    ("Navigate", &[
         ("j k  ↑ ↓", "up / down"),
         ("Home End", "top / bottom"),
         ("PgUp PgDn", "page"),
         ("Tab  h l", "switch pane"),
         ("1-9", "jump to pinned project"),
     ]),
-    ("View", &[
-        ("Enter", "show / hide issue detail"),
+    ("Panels", &[
+        ("Enter", "issue detail"),
         ("J K", "scroll detail"),
-        ("z", "show / hide projects"),
-        ("/", "filter issues"),
-        ("t", "sort by column (again to flip)"),
-        ("f", "filters: status, assignee, priority, type, JQL"),
+        ("z", "projects sidebar"),
+        ("g", "pull requests"),
         ("o", "open issue / PR in browser"),
-        ("g", "show / hide pull requests"),
     ]),
+    ("Find", &[
+        ("/", "search text"),
+        ("f", "filters (status, type, JQL…)"),
+        ("t", "sort by column (again flips)"),
+        ("Esc", "clear search, then marks"),
+    ]),
+];
+
+const HELP_RIGHT: &[HelpGroup] = &[
     ("Edit", &[
         ("Space", "mark / unmark issue"),
         ("Ctrl+a", "mark / unmark all"),
-        ("Esc", "clear filter, then marks"),
-        ("s", "change status"),
-        ("a", "change assignee"),
-        ("p", "change priority"),
+        ("s", "status"),
+        ("a", "assignee"),
+        ("p", "priority"),
     ]),
-    ("Other", &[
-        ("*", "pin / unpin project"),
-        ("c", "mark all listed issues as seen (clears ◆)"),
+    ("Project", &[
+        ("*", "pin / unpin"),
         ("r", "refresh project + PRs"),
         ("R", "reload everything"),
+        ("c", "mark listed issues as seen"),
         ("Ctrl+c", "quit"),
     ]),
 ];
 
-fn draw_help(f: &mut Frame) {
-    let mut lines: Vec<Line> = vec![];
-    for (group, keys) in HELP {
-        lines.push(Line::from(Span::styled(*group, Style::new().fg(ACCENT).bold())));
+fn help_lines(groups: &[HelpGroup]) -> Vec<Line<'static>> {
+    let mut lines = vec![];
+    for (i, (group, keys)) in groups.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::raw(""));
+        }
+        lines.push(section(group));
         for (k, d) in *keys {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {k:<12}"), Style::new().fg(Color::Yellow)),
+                Span::styled(format!(" {k:<11}"), Style::new().fg(Color::Yellow)),
                 Span::raw(*d),
             ]));
         }
-        lines.push(Line::raw(""));
+        if *group == "Edit" {
+            lines.push(Line::from(" acts on marked issues, else the selected one".dark_gray()));
+        }
     }
-    lines.push(Line::from("Edits apply to marked issues, or the selected one if none.".dark_gray()));
-    lines.push(Line::from("◆ = new/changed since you last looked · ◎ My work = assigned to me".dark_gray()));
-    lines.push(Line::from("Press any key to close".dark_gray()));
+    lines
+}
+
+fn legend_lines() -> Vec<Line<'static>> {
+    let sym = |s: &'static str, c: Color, d: &'static str| {
+        Line::from(vec![Span::styled(format!(" {s:<11}"), Style::new().fg(c)), Span::raw(d)])
+    };
+    vec![
+        Line::raw(""),
+        section("Legend"),
+        sym("●", MARK, "marked"),
+        sym("◆", CHANGED, "new / changed since last look"),
+        sym("◎ My work", ACCENT, "assigned to you, all projects"),
+        Line::from(vec![
+            Span::styled(" #123       ", Style::new().fg(Color::Yellow)),
+            Span::raw("PR: "),
+            Span::styled("review", Style::new().fg(Color::Yellow)),
+            Span::raw(" · "),
+            Span::styled("approved", Style::new().fg(Color::Green)),
+            Span::raw(" · "),
+            Span::styled("changes", Style::new().fg(Color::Red)),
+        ]),
+    ]
+}
+
+fn draw_help(f: &mut Frame) {
+    let left = help_lines(HELP_LEFT);
+    let mut right = help_lines(HELP_RIGHT);
+    right.extend(legend_lines());
 
     let area = f.area();
-    let h = (lines.len() as u16 + 2).min(area.height);
-    let w = 62.min(area.width);
-    let [r] = Layout::horizontal([Constraint::Length(w)]).flex(Flex::Center).areas(area);
-    let [r] = Layout::vertical([Constraint::Length(h)]).flex(Flex::Center).areas(r);
+    let two = area.width >= 100;
+    let (w, h) = if two {
+        (100, left.len().max(right.len()) as u16 + 2)
+    } else {
+        (area.width.min(50), (left.len() + right.len() + 1) as u16 + 2)
+    };
+    let [r] = Layout::horizontal([Constraint::Length(w.min(area.width))]).flex(Flex::Center).areas(area);
+    let [r] = Layout::vertical([Constraint::Length(h.min(area.height))]).flex(Flex::Center).areas(r);
     f.render_widget(Clear, r);
     let b = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(ACCENT))
-        .title(" Keys ");
-    f.render_widget(Paragraph::new(lines).block(b), r);
+        .title(" Keys ")
+        .title_bottom(Line::from(" any key closes ".dark_gray()).right_aligned());
+    let inner = b.inner(r).inner(ratatui::layout::Margin::new(1, 0));
+    f.render_widget(b, r);
+    if two {
+        let [a, _, c] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(3), Constraint::Fill(1)]).areas(inner);
+        f.render_widget(Paragraph::new(left), a);
+        f.render_widget(Paragraph::new(right), c);
+    } else {
+        let mut all = left;
+        all.push(Line::raw(""));
+        all.extend(right);
+        f.render_widget(Paragraph::new(all), inner);
+    }
 }
 
 fn draw_filter(f: &mut Frame, app: &mut App) {
