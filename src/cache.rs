@@ -47,6 +47,8 @@ pub struct Cache {
     pub users: HashMap<String, Vec<(String, String)>>,
     /// (accountId, displayName) of the logged-in Jira user
     pub me: Option<(String, String)>,
+    /// PR pane hidden (`g`)
+    pub hide_prs: bool,
 }
 
 /// Keep at most this many cached lists (newest first).

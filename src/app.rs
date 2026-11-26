@@ -558,9 +558,14 @@ impl App {
         if view == MY_WORK { cfg.all_repos() } else { cfg.repos_for(view) }
     }
 
-    /// Whether the current view has a PR pane.
-    pub fn show_prs(&self) -> bool {
+    /// Whether the current view has GitHub repos (PRs are fetched and linked to issues).
+    pub fn has_prs(&self) -> bool {
         self.current_project().is_some_and(|p| !self.repos_for(&p.key).is_empty())
+    }
+
+    /// Whether the PR pane is visible (toggled with `g`).
+    pub fn show_prs(&self) -> bool {
+        !self.cache.hide_prs && self.has_prs()
     }
 
     pub fn visible_prs(&self) -> &[Pr] {
@@ -611,6 +616,9 @@ impl App {
 
     /// Called every loop iteration: lazily loads the detail of the selected issue (debounced).
     pub fn tick(&mut self) {
+        if self.focus == Pane::Prs && !self.show_prs() {
+            self.focus = Pane::Issues;
+        }
         let key = self.current_issue_key();
         if key != self.last_key {
             self.last_key = key.clone();
@@ -1269,7 +1277,17 @@ impl App {
                 }
             }
             KeyCode::Char('g') => {
-                self.focus = if self.focus == Pane::Prs || !self.show_prs() { Pane::Issues } else { Pane::Prs };
+                if !self.has_prs() {
+                    self.status = "No GitHub repos for this project (see [github] in the config)".into();
+                } else {
+                    self.cache.hide_prs = !self.cache.hide_prs;
+                    self.dirty = true;
+                    if self.show_prs() {
+                        self.focus = Pane::Prs;
+                    } else if self.focus == Pane::Prs {
+                        self.focus = Pane::Issues;
+                    }
+                }
             }
             KeyCode::Char(' ' | 's' | 'a' | 'p') if self.focus == Pane::Prs => {
                 self.status = "Pull requests are read-only here (o opens in browser)".into();

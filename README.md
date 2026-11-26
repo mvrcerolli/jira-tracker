@@ -41,7 +41,7 @@ Press `?` inside jt for the full list.
 | `Enter` | show / hide issue detail |
 | `J`/`K` | scroll detail |
 | `o` | open issue / PR in browser |
-| `g` | jump between issues and pull requests |
+| `g` | show / hide pull requests (showing focuses them) |
 | `/` | text filter |
 | `f` | filters (status, assignee, priority, type, JQL), saved per project |
 | `t` | sort by column |

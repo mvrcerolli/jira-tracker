@@ -130,7 +130,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_issues(f: &mut Frame, app: &mut App, area: Rect) {
     let baselined = app.current_project().is_some_and(|p| app.cache.baselined.contains(&p.key));
     let issues = app.visible_issues();
-    let show_pr = app.show_prs();
+    let show_pr = app.has_prs();
     let by_issue = app.prs_by_issue();
     let pr_cell = |key: &str| -> Cell<'static> {
         let Some(ps) = by_issue.get(key) else { return Cell::from("") };
@@ -373,7 +373,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("t", "sort by column (again to flip)"),
         ("f", "filters: status, assignee, priority, type, JQL"),
         ("o", "open issue / PR in browser"),
-        ("g", "jump between issues and pull requests"),
+        ("g", "show / hide pull requests"),
     ]),
     ("Edit", &[
         ("Space", "mark / unmark issue"),
