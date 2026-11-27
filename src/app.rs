@@ -199,6 +199,8 @@ pub struct App {
     pub popup: Option<Popup>,
     popup_seq: u64,
     pub focus: Pane,
+    /// last focused list (Issues or Prs), to sync issue <-> PR selection on switch
+    prev_list: Pane,
     pub filter: String,
     pub filtering: bool,
     pub status: String,
@@ -254,6 +256,7 @@ impl App {
             popup: None,
             popup_seq: 0,
             focus: Pane::Projects,
+            prev_list: Pane::Issues,
             filter: String::new(),
             filtering: false,
             status: String::new(),
@@ -579,6 +582,25 @@ impl App {
     }
 
     /// Open PRs linked to each Jira issue (by key in the PR title or branch), from every cached view.
+    /// Focus moved to the PR pane: highlight the selected issue's PR, if it has one.
+    fn select_pr_of_issue(&mut self) {
+        let Some(key) = self.current_issue_key() else { return };
+        if let Some(i) = self.visible_prs().iter().position(|p| p.issue.as_deref() == Some(key.as_str())) {
+            self.pr_state.select(Some(i));
+        }
+    }
+
+    /// Focus moved back to the issues: highlight the selected PR's issue, if listed.
+    fn select_issue_of_pr(&mut self) {
+        let Some(key) = self.pr_state.selected().and_then(|i| self.visible_prs().get(i)).and_then(|p| p.issue.clone())
+        else {
+            return;
+        };
+        if let Some(i) = self.visible_issues().iter().position(|x| x.key == key) {
+            self.issue_state.select(Some(i));
+        }
+    }
+
     pub fn prs_by_issue(&self) -> HashMap<&str, Vec<&Pr>> {
         let mut m: HashMap<&str, Vec<&Pr>> = HashMap::new();
         let mut seen = HashSet::new();
@@ -605,6 +627,10 @@ impl App {
     pub fn tick(&mut self) {
         if self.focus == Pane::Prs && !self.show_prs() {
             self.focus = Pane::Issues;
+        }
+        if matches!(self.focus, Pane::Issues | Pane::Prs) && self.focus != self.prev_list {
+            if self.focus == Pane::Prs { self.select_pr_of_issue() } else { self.select_issue_of_pr() }
+            self.prev_list = self.focus;
         }
         let key = self.current_issue_key();
         if key != self.last_key {

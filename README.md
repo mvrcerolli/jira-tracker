@@ -57,7 +57,7 @@ Press `?` inside jt for the full list.
 - **◎ My work** (top of the sidebar): everything assigned to you across all projects.
 - **Cache:** jt opens instantly with the last data (`~/.cache/jt/cache.json`, `%LOCALAPPDATA%\jt\cache.json` on Windows) and refreshes in the background.
 - **Auto-refresh** every `refresh_minutes` (default 5). Issues new or changed since you last looked show `◆`; the sidebar shows `+N` per project. Moving the cursor onto an issue marks it seen.
-- **PR column:** when the project has GitHub repos, each issue shows its open PR (`#123`, `+N` if more), linked by the Jira key in the PR title or branch. Color = review state.
+- **PR column:** when the project has GitHub repos, each issue shows its open PR (`#123`, `+N` if more), linked by the Jira key in the PR title or branch. Color = review state. Switching focus between issues and PRs keeps the selection linked (issue → its PR and back).
 - **Labels column:** shows the most important label plus `+N` for the rest. Importance is the order you set with `L` (unlisted labels come after, A→Z).
 
 Pins, filters and the column / label layout are stored next to the config (`pinned.txt`, `filters.toml`, `view.toml`).
